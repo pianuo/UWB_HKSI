@@ -140,10 +140,10 @@ class SettingsDialog(tk.Toplevel):
 class TransformSettingsDialog(tk.Toplevel):
     """Dialog for configuring UWB anchor transformation (rotation, scale, offset)."""
     
-    def __init__(self, parent, scale: float, rotation_deg: float, offset_x: float, offset_y: float):
+    def __init__(self, parent, scale: float, rotation_deg: float, offset_x: float, offset_y: float, apply_callback=None):
         super().__init__(parent)
         self.title("UWB Transform Settings")
-        self.geometry("400x250")
+        self.geometry("450x420")
         self.resizable(False, False)
         self.transient(parent)
         self.grab_set()
@@ -153,6 +153,7 @@ class TransformSettingsDialog(tk.Toplevel):
         self.rotation_deg = rotation_deg
         self.offset_x = offset_x
         self.offset_y = offset_y
+        self.apply_callback = apply_callback  # Callback function to apply settings without closing
         
         self._create_widgets()
         self._load_values()
@@ -161,45 +162,60 @@ class TransformSettingsDialog(tk.Toplevel):
         main_frame = ttk.Frame(self, padding=10)
         main_frame.pack(fill=tk.BOTH, expand=True)
         
-        # Title
-        ttk.Label(main_frame, text="UWB Coordinate Transformation", 
-                  font=("Arial", 11, "bold")).pack(pady=(0, 10))
+        # Title and instructions
+        title_label = ttk.Label(main_frame, text="UWB Coordinate Transformation", 
+                  font=("Arial", 12, "bold"))
+        title_label.pack(pady=(0, 5))
+        
+        info_label = ttk.Label(main_frame, 
+                  text="Adjust these values to align UWB anchors with the background image.\nClick 'Apply' to update the map immediately.",
+                  font=("Arial", 9), foreground="gray", justify=tk.LEFT)
+        info_label.pack(pady=(0, 10))
         
         # Scale
-        scale_frame = ttk.LabelFrame(main_frame, text="Scale", padding=5)
-        scale_frame.pack(fill=tk.X, pady=5)
-        ttk.Label(scale_frame, text="Scale Factor:").pack(side=tk.LEFT, padx=5)
-        self.scale_entry = ttk.Entry(scale_frame, width=15)
+        scale_frame = ttk.LabelFrame(main_frame, text="Scale Factor", padding=5)
+        scale_frame.pack(fill=tk.X, pady=3)
+        scale_row = ttk.Frame(scale_frame)
+        scale_row.pack(fill=tk.X)
+        ttk.Label(scale_row, text="Scale:").pack(side=tk.LEFT, padx=5)
+        self.scale_entry = ttk.Entry(scale_row, width=20)
         self.scale_entry.pack(side=tk.LEFT, padx=5)
+        ttk.Label(scale_row, text="(e.g., 1.0 = no scaling)", font=("Arial", 8), foreground="gray").pack(side=tk.LEFT, padx=5)
         
         # Rotation
         rot_frame = ttk.LabelFrame(main_frame, text="Rotation", padding=5)
-        rot_frame.pack(fill=tk.X, pady=5)
-        ttk.Label(rot_frame, text="Rotation (degrees):").pack(side=tk.LEFT, padx=5)
-        self.rotation_entry = ttk.Entry(rot_frame, width=15)
+        rot_frame.pack(fill=tk.X, pady=3)
+        rot_row = ttk.Frame(rot_frame)
+        rot_row.pack(fill=tk.X)
+        ttk.Label(rot_row, text="Angle:").pack(side=tk.LEFT, padx=5)
+        self.rotation_entry = ttk.Entry(rot_row, width=20)
         self.rotation_entry.pack(side=tk.LEFT, padx=5)
+        ttk.Label(rot_row, text="degrees (e.g., 0 = no rotation)", font=("Arial", 8), foreground="gray").pack(side=tk.LEFT, padx=5)
         
         # Offset
         offset_frame = ttk.LabelFrame(main_frame, text="Offset (meters)", padding=5)
-        offset_frame.pack(fill=tk.X, pady=5)
+        offset_frame.pack(fill=tk.X, pady=3)
         
-        offset_row = ttk.Frame(offset_frame)
-        offset_row.pack(fill=tk.X)
-        
-        ttk.Label(offset_row, text="X:").grid(row=0, column=0, padx=(5, 2))
-        self.offset_x_entry = ttk.Entry(offset_row, width=12)
-        self.offset_x_entry.grid(row=0, column=1, padx=(0, 10))
-        
-        ttk.Label(offset_row, text="Y:").grid(row=0, column=2, padx=(5, 2))
-        self.offset_y_entry = ttk.Entry(offset_row, width=12)
+        offset_row1 = ttk.Frame(offset_frame)
+        offset_row1.pack(fill=tk.X)
+        ttk.Label(offset_row1, text="X Offset:").grid(row=0, column=0, padx=(5, 2), sticky=tk.W)
+        self.offset_x_entry = ttk.Entry(offset_row1, width=15)
+        self.offset_x_entry.grid(row=0, column=1, padx=(0, 15))
+        ttk.Label(offset_row1, text="Y Offset:", font=("Arial", 9)).grid(row=0, column=2, padx=(5, 2), sticky=tk.W)
+        self.offset_y_entry = ttk.Entry(offset_row1, width=15)
         self.offset_y_entry.grid(row=0, column=3, padx=(0, 5))
+        
+        # Status label for Apply feedback
+        self.status_label = ttk.Label(main_frame, text="", font=("Arial", 9))
+        self.status_label.pack(pady=(5, 0))
         
         # Buttons
         btn_frame = ttk.Frame(main_frame)
-        btn_frame.pack(fill=tk.X, pady=(20, 0))
+        btn_frame.pack(fill=tk.X, pady=(15, 0))
         
-        ttk.Button(btn_frame, text="OK", command=self._on_ok).pack(side=tk.RIGHT, padx=5)
-        ttk.Button(btn_frame, text="Cancel", command=self._on_cancel).pack(side=tk.RIGHT)
+        ttk.Button(btn_frame, text="Apply", command=self._on_apply, width=12).pack(side=tk.RIGHT, padx=5)
+        ttk.Label(btn_frame, text="(Settings apply immediately, dialog stays open)", font=("Arial", 8), foreground="green").pack(side=tk.RIGHT, padx=5)
+        ttk.Button(btn_frame, text="Close", command=self._on_close, width=12).pack(side=tk.LEFT, padx=5)
     
     def _load_values(self):
         self.scale_entry.insert(0, str(self.scale))
@@ -207,7 +223,36 @@ class TransformSettingsDialog(tk.Toplevel):
         self.offset_x_entry.insert(0, str(self.offset_x))
         self.offset_y_entry.insert(0, str(self.offset_y))
     
-    def _on_ok(self):
+    def _on_apply(self):
+        """Apply settings without closing dialog."""
+        try:
+            new_settings = {
+                "scale": float(self.scale_entry.get() or 1.0),
+                "rotation_deg": float(self.rotation_entry.get() or 0.0),
+                "offset_x": float(self.offset_x_entry.get() or 0.0),
+                "offset_y": float(self.offset_y_entry.get() or 0.0),
+            }
+            
+            # Update internal values
+            self.scale = new_settings["scale"]
+            self.rotation_deg = new_settings["rotation_deg"]
+            self.offset_x = new_settings["offset_x"]
+            self.offset_y = new_settings["offset_y"]
+            
+            # Call callback to apply settings and refresh map
+            if self.apply_callback:
+                self.apply_callback(new_settings)
+            
+            # Show success message
+            self.status_label.config(text="Settings applied!", foreground="green")
+            self.after(1000, lambda: self.status_label.config(text="", foreground="black"))
+            
+        except ValueError as e:
+            messagebox.showerror("Error", f"Invalid value: {e}")
+    
+    def _on_close(self):
+        """Close the dialog."""
+        # Save final values to result before closing
         try:
             self.result = {
                 "scale": float(self.scale_entry.get() or 1.0),
@@ -215,12 +260,14 @@ class TransformSettingsDialog(tk.Toplevel):
                 "offset_x": float(self.offset_x_entry.get() or 0.0),
                 "offset_y": float(self.offset_y_entry.get() or 0.0),
             }
-            self.destroy()
-        except ValueError as e:
-            messagebox.showerror("Error", f"Invalid value: {e}")
-    
-    def _on_cancel(self):
-        self.result = None
+        except ValueError:
+            # If invalid, use current values
+            self.result = {
+                "scale": self.scale,
+                "rotation_deg": self.rotation_deg,
+                "offset_x": self.offset_x,
+                "offset_y": self.offset_y,
+            }
         self.destroy()
 
 
@@ -325,10 +372,10 @@ class MainApplication:
         self.uwb_bg_image = None
         self.uwb_bg_photo = None
         
-        # UWB map canvas (for custom image background)
+        # UWB map canvas (for custom image background) - Square shape
         self.uwb_canvas = None
-        self.uwb_canvas_width = 450
-        self.uwb_canvas_height = 400
+        self.uwb_canvas_width = 450  # Square: 300x300
+        self.uwb_canvas_height = 450
         
         # GNSS tag update throttling (1 second)
         self.last_gnss_tag_update_time = 0.0
@@ -453,23 +500,32 @@ class MainApplication:
         maps_frame = ttk.Frame(main_frame)
         maps_frame.pack(fill=tk.BOTH, expand=True)
         
-        # UWB Map (Left) - Canvas with image background
+        # UWB Map (Left) - Canvas with image background (Square frame)
         uwb_frame = ttk.LabelFrame(maps_frame, text="UWB Positioning (Real-time)", padding=5)
-        uwb_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0, 2))
+        # Pack without expand to maintain square shape
+        uwb_frame.pack(side=tk.LEFT, padx=(0, 2))
         
-        self.uwb_canvas = tk.Canvas(uwb_frame, width=self.uwb_canvas_width, height=self.uwb_canvas_height, bg="white")
-        self.uwb_canvas.pack(fill=tk.BOTH, expand=True)
+        # Create canvas with fixed square size
+        self.uwb_canvas = tk.Canvas(
+            uwb_frame, 
+            width=self.uwb_canvas_width, 
+            height=self.uwb_canvas_height, 
+            bg="white", 
+            highlightthickness=0
+        )
+        # Pack canvas without fill/expand to maintain exact square size
+        self.uwb_canvas.pack()
         self.uwb_map = None  # Not using tkintermapview for UWB map
         
         # Load background image
         self._load_uwb_background_image()
         
-        # GNSS Map (Right) - Smaller size
+        # GNSS Map (Right) - Smaller size (matching UWB square)
         gnss_frame = ttk.LabelFrame(maps_frame, text="GNSS Positioning (1Hz)", padding=5)
         gnss_frame.pack(side=tk.RIGHT, fill=tk.BOTH, expand=True, padx=(2, 0))
         
         if HAS_MAP:
-            self.gnss_map = tkintermapview.TkinterMapView(gnss_frame, width=450, height=400)
+            self.gnss_map = tkintermapview.TkinterMapView(gnss_frame, width=300, height=300)
             self.gnss_map.pack(fill=tk.BOTH, expand=True)
             self.gnss_map.set_position(22.3193, 114.1694)
             self.gnss_map.set_zoom(18)
@@ -494,23 +550,23 @@ class MainApplication:
         metrics_frame = ttk.Frame(bottom_frame)
         metrics_frame.pack(fill=tk.X, pady=5)
         
-        # Speed (larger font)
-        speed_frame = ttk.LabelFrame(metrics_frame, text="Speed", padding=5)
+        # Speed (larger font - 1.5x: 24 -> 36)
+        speed_frame = ttk.LabelFrame(metrics_frame, text="Speed", padding=8)
         speed_frame.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=2)
         self.speed_var = tk.StringVar(value="0.00 m/s")
-        ttk.Label(speed_frame, textvariable=self.speed_var, font=("Consolas", 24, "bold")).pack()
+        ttk.Label(speed_frame, textvariable=self.speed_var, font=("Consolas", 36, "bold")).pack()
         
-        # Distance to line (larger font)
-        dist_frame = ttk.LabelFrame(metrics_frame, text="Distance to Start Line", padding=5)
+        # Distance to line (larger font - 1.5x: 24 -> 36)
+        dist_frame = ttk.LabelFrame(metrics_frame, text="Distance to Start Line", padding=8)
         dist_frame.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=2)
         self.distance_var = tk.StringVar(value="0.00 m")
-        ttk.Label(dist_frame, textvariable=self.distance_var, font=("Consolas", 24, "bold")).pack()
+        ttk.Label(dist_frame, textvariable=self.distance_var, font=("Consolas", 36, "bold")).pack()
         
-        # Time to line (larger font)
-        time_frame = ttk.LabelFrame(metrics_frame, text="Time to Start Line", padding=5)
+        # Time to line (larger font - 1.5x: 24 -> 36)
+        time_frame = ttk.LabelFrame(metrics_frame, text="Time to Start Line", padding=8)
         time_frame.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=2)
         self.time_to_line_var = tk.StringVar(value="-- s")
-        ttk.Label(time_frame, textvariable=self.time_to_line_var, font=("Consolas", 24, "bold")).pack()
+        ttk.Label(time_frame, textvariable=self.time_to_line_var, font=("Consolas", 36, "bold")).pack()
         
         # Row 3: Timing statistics
         timing_frame = ttk.LabelFrame(bottom_frame, text="Timing Statistics", padding=5)
@@ -519,17 +575,17 @@ class MainApplication:
         timing_grid = ttk.Frame(timing_frame)
         timing_grid.pack(fill=tk.X)
         
-        ttk.Label(timing_grid, text="Start Time:", font=("Arial", 11)).grid(row=0, column=0, padx=5, sticky=tk.W)
+        ttk.Label(timing_grid, text="Start Time:", font=("Arial", 14)).grid(row=0, column=0, padx=5, sticky=tk.W)
         self.start_time_var = tk.StringVar(value="--:--:--.---")
-        ttk.Label(timing_grid, textvariable=self.start_time_var, font=("Consolas", 18, "bold")).grid(row=0, column=1, padx=5, sticky=tk.W)
+        ttk.Label(timing_grid, textvariable=self.start_time_var, font=("Consolas", 27, "bold")).grid(row=0, column=1, padx=5, sticky=tk.W)
         
-        ttk.Label(timing_grid, text="End Time:", font=("Arial", 11)).grid(row=0, column=2, padx=5, sticky=tk.W)
+        ttk.Label(timing_grid, text="End Time:", font=("Arial", 14)).grid(row=0, column=2, padx=5, sticky=tk.W)
         self.end_time_var = tk.StringVar(value="--:--:--.---")
-        ttk.Label(timing_grid, textvariable=self.end_time_var, font=("Consolas", 18, "bold")).grid(row=0, column=3, padx=5, sticky=tk.W)
+        ttk.Label(timing_grid, textvariable=self.end_time_var, font=("Consolas", 27, "bold")).grid(row=0, column=3, padx=5, sticky=tk.W)
         
-        ttk.Label(timing_grid, text="Crossing Duration:", font=("Arial", 11)).grid(row=0, column=4, padx=5, sticky=tk.W)
+        ttk.Label(timing_grid, text="Crossing Duration:", font=("Arial", 14)).grid(row=0, column=4, padx=5, sticky=tk.W)
         self.duration_var = tk.StringVar(value="--.--- s")
-        ttk.Label(timing_grid, textvariable=self.duration_var, font=("Consolas", 18, "bold")).grid(row=0, column=5, padx=5, sticky=tk.W)
+        ttk.Label(timing_grid, textvariable=self.duration_var, font=("Consolas", 27, "bold")).grid(row=0, column=5, padx=5, sticky=tk.W)
         
         # Row 4: Controls
         ctrl_frame = ttk.Frame(bottom_frame)
@@ -562,20 +618,36 @@ class MainApplication:
         self.gnss_label.pack(side=tk.LEFT, padx=5)
     
     def _load_uwb_background_image(self):
-        """Load the UWB background image."""
+        """Load the UWB background image, zoom in 2x and fill the canvas."""
         if not HAS_PIL:
             return
         
         try:
             if os.path.exists(self.uwb_bg_image_path):
-                self.uwb_bg_image = Image.open(self.uwb_bg_image_path)
-                # Resize to fit canvas
-                self.uwb_bg_image = self.uwb_bg_image.resize(
+                # Load original image
+                original_image = Image.open(self.uwb_bg_image_path)
+                orig_width, orig_height = original_image.size
+                
+                # Calculate crop area for 2x zoom (show center portion)
+                # Crop to show 1/2 of the original (center crop)
+                crop_size = min(orig_width, orig_height) // 2
+                left = (orig_width - crop_size) // 2
+                top = (orig_height - crop_size) // 2
+                right = left + crop_size
+                bottom = top + crop_size
+                
+                # Crop center portion
+                cropped_image = original_image.crop((left, top, right, bottom))
+                
+                # Resize cropped image to fill canvas (2x zoom effect)
+                self.uwb_bg_image = cropped_image.resize(
                     (self.uwb_canvas_width, self.uwb_canvas_height),
                     Image.Resampling.LANCZOS
                 )
+                
                 self.uwb_bg_photo = ImageTk.PhotoImage(self.uwb_bg_image)
                 print(f"[UWB] Loaded background image: {self.uwb_bg_image_path}")
+                print(f"[UWB] Original: {orig_width}x{orig_height}, Cropped (2x zoom): {crop_size}x{crop_size}, Canvas: {self.uwb_canvas_width}x{self.uwb_canvas_height}")
             else:
                 print(f"[UWB] Background image not found: {self.uwb_bg_image_path}")
         except Exception as e:
@@ -594,15 +666,25 @@ class MainApplication:
     
     def _show_transform_settings(self):
         """Show transform settings dialog."""
+        def apply_settings(settings):
+            """Callback to apply settings immediately."""
+            self.uwb_scale = settings["scale"]
+            self.uwb_rotation_deg = settings["rotation_deg"]
+            self.uwb_offset_x = settings["offset_x"]
+            self.uwb_offset_y = settings["offset_y"]
+            self._draw_uwb_map()
+        
         dialog = TransformSettingsDialog(
             self.root, 
             self.uwb_scale, 
             self.uwb_rotation_deg,
             self.uwb_offset_x,
-            self.uwb_offset_y
+            self.uwb_offset_y,
+            apply_callback=apply_settings  # Pass callback function
         )
         self.root.wait_window(dialog)
         
+        # Final update when dialog closes (in case user changed values but didn't click Apply)
         if dialog.result:
             self.uwb_scale = dialog.result["scale"]
             self.uwb_rotation_deg = dialog.result["rotation_deg"]
