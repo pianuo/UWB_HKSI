@@ -1,0 +1,20 @@
+# UWB Line Tracker Requirements
+
+# Core dependencies (standard library)
+# tkinter - usually comes with Python
+
+# Map visualization
+tkintermapview>=1.29
+
+# Numerical computation
+numpy>=1.20.0
+
+# ZMQ for inter-process communication (GNSS data)
+pyzmq>=22.0.0
+
+# Image processing for UWB background map
+Pillow>=8.0.0
+
+# Optional: For enhanced coordinate transformations
+# pyproj>=3.0.0
+
