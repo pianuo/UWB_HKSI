@@ -47,6 +47,8 @@ from .coordinate_transform import (
 )
 from .udp_receiver import UDPReceiver, UWBTagData
 from .gnss_receiver import GNSSReceiver, GNSSData
+from .anchor_calibration import RealTimeCalibrator, AnchorPosition, CalibrationResult
+from .trilateration import TrilaterationEngine, UWBPositionCalculator
 
 
 @dataclass
@@ -62,12 +64,253 @@ class TimingStats:
         self.crossing_time = None
 
 
+class AnchorCalibrationDialog(tk.Toplevel):
+    """
+    Dialog for UWB Anchor Self-Calibration.
+    
+    Features:
+    - "Calibrate" button: Gets real-time calibration data and displays it
+    - "Confirm" button: Applies the calibrated positions as anchor coordinates
+    
+    Based on RTLSClient.cpp lines 1046-1179 algorithm.
+    """
+    
+    def __init__(self, parent, calibrator: RealTimeCalibrator, apply_callback=None):
+        super().__init__(parent)
+        self.title("UWB Anchor Self-Calibration")
+        self.geometry("550x550")
+        self.resizable(False, False)
+        self.transient(parent)
+        self.grab_set()
+        
+        self.calibrator = calibrator
+        self.apply_callback = apply_callback
+        self.result = None
+        self.calibration_result: Optional[CalibrationResult] = None
+        
+        self._create_widgets()
+        self._update_status()
+    
+    def _create_widgets(self):
+        main_frame = ttk.Frame(self, padding=10)
+        main_frame.pack(fill=tk.BOTH, expand=True)
+        
+        # Title
+        ttk.Label(main_frame, text="UWB Anchor Self-Calibration", 
+                  font=("Arial", 14, "bold")).pack(pady=(0, 10))
+        
+        # Instructions
+        info_text = (
+            "This tool calibrates anchor positions using inter-anchor range measurements.\n"
+            "Algorithm: MDS (Multi-Dimensional Scaling) + Angle Rotation\n"
+            "Result: A0 at origin, A1 on X-axis, A2 in first quadrant"
+        )
+        ttk.Label(main_frame, text=info_text, font=("Arial", 9), 
+                  foreground="gray", justify=tk.LEFT).pack(pady=(0, 10))
+        
+        # Distance Matrix Display
+        dist_frame = ttk.LabelFrame(main_frame, text="Inter-Anchor Distances (meters)", padding=5)
+        dist_frame.pack(fill=tk.X, pady=5)
+        
+        self.distance_labels = {}
+        dist_grid = ttk.Frame(dist_frame)
+        dist_grid.pack(fill=tk.X)
+        
+        # Headers
+        ttk.Label(dist_grid, text="Pair", font=("Arial", 10, "bold")).grid(row=0, column=0, padx=5)
+        ttk.Label(dist_grid, text="Count", font=("Arial", 10, "bold")).grid(row=0, column=1, padx=5)
+        ttk.Label(dist_grid, text="Avg Distance", font=("Arial", 10, "bold")).grid(row=0, column=2, padx=5)
+        
+        # Distance rows
+        pairs = ["A0-A1", "A0-A2", "A1-A2"]
+        for i, pair in enumerate(pairs):
+            ttk.Label(dist_grid, text=pair, font=("Consolas", 10)).grid(row=i+1, column=0, padx=5, sticky=tk.W)
+            count_label = ttk.Label(dist_grid, text="0", font=("Consolas", 10))
+            count_label.grid(row=i+1, column=1, padx=5)
+            dist_label = ttk.Label(dist_grid, text="-- m", font=("Consolas", 10))
+            dist_label.grid(row=i+1, column=2, padx=5)
+            self.distance_labels[pair] = {"count": count_label, "distance": dist_label}
+        
+        # Manual Distance Entry
+        manual_frame = ttk.LabelFrame(main_frame, text="Manual Distance Entry (mm)", padding=5)
+        manual_frame.pack(fill=tk.X, pady=5)
+        
+        manual_row = ttk.Frame(manual_frame)
+        manual_row.pack(fill=tk.X)
+        
+        ttk.Label(manual_row, text="A0-A1:").grid(row=0, column=0, padx=2)
+        self.dist_01_entry = ttk.Entry(manual_row, width=10)
+        self.dist_01_entry.grid(row=0, column=1, padx=2)
+        
+        ttk.Label(manual_row, text="A0-A2:").grid(row=0, column=2, padx=2)
+        self.dist_02_entry = ttk.Entry(manual_row, width=10)
+        self.dist_02_entry.grid(row=0, column=3, padx=2)
+        
+        ttk.Label(manual_row, text="A1-A2:").grid(row=0, column=4, padx=2)
+        self.dist_12_entry = ttk.Entry(manual_row, width=10)
+        self.dist_12_entry.grid(row=0, column=5, padx=2)
+        
+        ttk.Button(manual_row, text="Add", command=self._add_manual_distances).grid(row=0, column=6, padx=5)
+        
+        # Calibrated Positions Display
+        pos_frame = ttk.LabelFrame(main_frame, text="Calibrated Anchor Positions", padding=5)
+        pos_frame.pack(fill=tk.X, pady=5)
+        
+        self.position_labels = {}
+        pos_grid = ttk.Frame(pos_frame)
+        pos_grid.pack(fill=tk.X)
+        
+        ttk.Label(pos_grid, text="Anchor", font=("Arial", 10, "bold")).grid(row=0, column=0, padx=5)
+        ttk.Label(pos_grid, text="X (m)", font=("Arial", 10, "bold")).grid(row=0, column=1, padx=5)
+        ttk.Label(pos_grid, text="Y (m)", font=("Arial", 10, "bold")).grid(row=0, column=2, padx=5)
+        ttk.Label(pos_grid, text="Z (m)", font=("Arial", 10, "bold")).grid(row=0, column=3, padx=5)
+        
+        for i in range(3):
+            ttk.Label(pos_grid, text=f"A{i}", font=("Consolas", 10)).grid(row=i+1, column=0, padx=5, sticky=tk.W)
+            x_label = ttk.Label(pos_grid, text="--", font=("Consolas", 10))
+            x_label.grid(row=i+1, column=1, padx=5)
+            y_label = ttk.Label(pos_grid, text="--", font=("Consolas", 10))
+            y_label.grid(row=i+1, column=2, padx=5)
+            z_label = ttk.Label(pos_grid, text="0.00", font=("Consolas", 10))
+            z_label.grid(row=i+1, column=3, padx=5)
+            self.position_labels[f"A{i}"] = {"x": x_label, "y": y_label, "z": z_label}
+        
+        # Status
+        self.status_var = tk.StringVar(value="Waiting for distance measurements...")
+        self.status_label = ttk.Label(main_frame, textvariable=self.status_var, 
+                                       font=("Arial", 10), foreground="orange")
+        self.status_label.pack(pady=10)
+        
+        # Buttons
+        btn_frame = ttk.Frame(main_frame)
+        btn_frame.pack(fill=tk.X, pady=(10, 0))
+        
+        ttk.Button(btn_frame, text="Calibrate", command=self._calibrate, 
+                   width=15).pack(side=tk.LEFT, padx=5)
+        ttk.Button(btn_frame, text="Reset", command=self._reset, 
+                   width=12).pack(side=tk.LEFT, padx=5)
+        
+        ttk.Button(btn_frame, text="Close", command=self._on_close, 
+                   width=12).pack(side=tk.RIGHT, padx=5)
+        ttk.Button(btn_frame, text="Confirm", command=self._on_confirm, 
+                   width=15).pack(side=tk.RIGHT, padx=5)
+    
+    def _add_manual_distances(self):
+        """Add manual distance measurements."""
+        try:
+            d01 = self.dist_01_entry.get().strip()
+            d02 = self.dist_02_entry.get().strip()
+            d12 = self.dist_12_entry.get().strip()
+            
+            if d01:
+                self.calibrator.add_measurement(0, 1, float(d01) / 1000.0)
+            if d02:
+                self.calibrator.add_measurement(0, 2, float(d02) / 1000.0)
+            if d12:
+                self.calibrator.add_measurement(1, 2, float(d12) / 1000.0)
+            
+            self._update_status()
+            self.status_var.set("Manual distances added")
+            self.status_label.config(foreground="blue")
+        except ValueError as e:
+            messagebox.showerror("Error", f"Invalid distance value: {e}")
+    
+    def _update_status(self):
+        """Update distance and status display."""
+        status = self.calibrator.get_measurement_status()
+        
+        for pair, info in status.items():
+            if pair in self.distance_labels:
+                self.distance_labels[pair]["count"].config(text=str(info["count"]))
+                if info["count"] > 0:
+                    self.distance_labels[pair]["distance"].config(
+                        text=f"{info['average_distance']:.3f} m"
+                    )
+                else:
+                    self.distance_labels[pair]["distance"].config(text="-- m")
+        
+        if self.calibrator.has_sufficient_data():
+            self.status_var.set("Ready to calibrate")
+            self.status_label.config(foreground="green")
+        else:
+            self.status_var.set("Need more measurements")
+            self.status_label.config(foreground="orange")
+    
+    def _calibrate(self):
+        """Perform calibration."""
+        if not self.calibrator.has_sufficient_data():
+            messagebox.showwarning("Warning", "Insufficient data for calibration.\nNeed at least one measurement for each anchor pair.")
+            return
+        
+        result = self.calibrator.perform_calibration()
+        self.calibration_result = result
+        
+        if result.success:
+            # Update position display
+            for anchor in result.anchors:
+                key = f"A{anchor.anchor_id}"
+                if key in self.position_labels:
+                    self.position_labels[key]["x"].config(text=f"{anchor.x:.3f}")
+                    self.position_labels[key]["y"].config(text=f"{anchor.y:.3f}")
+                    self.position_labels[key]["z"].config(text=f"{anchor.z:.3f}")
+            
+            self.status_var.set("Calibration successful!")
+            self.status_label.config(foreground="green")
+        else:
+            self.status_var.set(f"Calibration failed: {result.error_message}")
+            self.status_label.config(foreground="red")
+    
+    def _reset(self):
+        """Reset calibration data."""
+        self.calibrator.reset()
+        self.calibration_result = None
+        
+        # Clear position display
+        for key in self.position_labels:
+            self.position_labels[key]["x"].config(text="--")
+            self.position_labels[key]["y"].config(text="--")
+        
+        # Clear distance entries
+        self.dist_01_entry.delete(0, tk.END)
+        self.dist_02_entry.delete(0, tk.END)
+        self.dist_12_entry.delete(0, tk.END)
+        
+        self._update_status()
+        self.status_var.set("Reset complete")
+        self.status_label.config(foreground="blue")
+    
+    def _on_confirm(self):
+        """Confirm and apply calibrated positions."""
+        if not self.calibration_result or not self.calibration_result.success:
+            messagebox.showwarning("Warning", "No valid calibration result to confirm.\nPlease calibrate first.")
+            return
+        
+        # Convert to anchor dict format
+        self.result = []
+        for anchor in self.calibration_result.anchors:
+            self.result.append({
+                "x": anchor.x,
+                "y": anchor.y,
+                "z": anchor.z
+            })
+        
+        if self.apply_callback:
+            self.apply_callback(self.result)
+        
+        self.status_var.set("Positions confirmed and applied!")
+        self.status_label.config(foreground="green")
+    
+    def _on_close(self):
+        """Close the dialog."""
+        self.destroy()
+
+
 class SettingsDialog(tk.Toplevel):
-    """Dialog for configuring UWB anchor positions."""
+    """Dialog for configuring UWB anchor positions manually."""
     
     def __init__(self, parent, current_anchors: list[dict]):
         super().__init__(parent)
-        self.title("UWB Anchor Settings")
+        self.title("UWB Anchor Settings (Manual)")
         self.geometry("400x350")
         self.resizable(False, False)
         self.transient(parent)
@@ -351,6 +594,13 @@ class MainApplication:
         self.gnss_receiver = GNSSReceiver()
         self.tcp_server = TCPServerManager()
         
+        # Anchor self-calibration
+        self.anchor_calibrator = RealTimeCalibrator(num_anchors=3)
+        
+        # Trilateration engine for position calculation
+        self.trilateration_engine = TrilaterationEngine()
+        self.use_trilateration = False  # Toggle for using trilateration vs UDP position
+        
         # UWB anchor positions (to be configured)
         self.uwb_anchors = [
             {"x": 0.0, "y": 0.0, "z": 0.0},
@@ -501,7 +751,7 @@ class MainApplication:
         maps_frame.pack(fill=tk.BOTH, expand=True)
         
         # UWB Map (Left) - Canvas with image background (Square frame)
-        uwb_frame = ttk.LabelFrame(maps_frame, text="UWB Positioning (Real-time)", padding=5)
+        uwb_frame = ttk.LabelFrame(maps_frame, text="UWB Positioning", padding=5)
         # Pack without expand to maintain square shape
         uwb_frame.pack(side=tk.LEFT, padx=(0, 2))
         
@@ -521,7 +771,7 @@ class MainApplication:
         self._load_uwb_background_image()
         
         # GNSS Map (Right) - Smaller size (matching UWB square)
-        gnss_frame = ttk.LabelFrame(maps_frame, text="GNSS Positioning (1Hz)", padding=5)
+        gnss_frame = ttk.LabelFrame(maps_frame, text="GNSS Positioning", padding=5)
         gnss_frame.pack(side=tk.RIGHT, fill=tk.BOTH, expand=True, padx=(2, 0))
         
         if HAS_MAP:
@@ -591,15 +841,23 @@ class MainApplication:
         ctrl_frame = ttk.Frame(bottom_frame)
         ctrl_frame.pack(fill=tk.X, pady=5)
         
-        ttk.Button(ctrl_frame, text="Configure UWB Anchors", 
+        # Anchor configuration buttons
+        ttk.Button(ctrl_frame, text="Anchor Self-Calibration", 
                    command=self._show_anchor_settings).pack(side=tk.LEFT, padx=5)
+        ttk.Button(ctrl_frame, text="Manual Anchor Settings", 
+                   command=self._show_manual_anchor_settings).pack(side=tk.LEFT, padx=5)
         ttk.Button(ctrl_frame, text="UWB Transform Settings", 
                    command=self._show_transform_settings).pack(side=tk.LEFT, padx=5)
+        
+        # Separator
+        ttk.Separator(ctrl_frame, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=10)
+        
+        # Timing buttons
         ttk.Button(ctrl_frame, text="Reset Timing", 
                    command=self._reset_timing).pack(side=tk.LEFT, padx=5)
         ttk.Button(ctrl_frame, text="Start Timing", 
                    command=self._start_timing).pack(side=tk.LEFT, padx=5)
-        ttk.Button(ctrl_frame, text="Recalibrate", 
+        ttk.Button(ctrl_frame, text="Recalibrate GNSS", 
                    command=self._manual_calibrate).pack(side=tk.LEFT, padx=5)
         
         # Status indicators frame
@@ -654,12 +912,38 @@ class MainApplication:
             print(f"[UWB] Failed to load background image: {e}")
     
     def _show_anchor_settings(self):
-        """Show anchor settings dialog."""
+        """Show anchor self-calibration dialog."""
+        def apply_calibrated_anchors(anchors):
+            """Apply calibrated anchor positions."""
+            self.uwb_anchors = anchors
+            # Update trilateration engine
+            self.trilateration_engine.set_anchors(anchors)
+            if self.gnss_calibrated:
+                self._auto_calibrate()
+            self._draw_uwb_map()
+            print(f"[Anchor Calibration] Applied new positions:")
+            for i, a in enumerate(anchors):
+                print(f"  A{i}: ({a['x']:.3f}, {a['y']:.3f}, {a['z']:.3f})")
+        
+        dialog = AnchorCalibrationDialog(
+            self.root, 
+            self.anchor_calibrator,
+            apply_callback=apply_calibrated_anchors
+        )
+        self.root.wait_window(dialog)
+        
+        # If user confirmed calibration
+        if dialog.result:
+            apply_calibrated_anchors(dialog.result)
+    
+    def _show_manual_anchor_settings(self):
+        """Show manual anchor settings dialog."""
         dialog = SettingsDialog(self.root, self.uwb_anchors)
         self.root.wait_window(dialog)
         
         if dialog.result:
             self.uwb_anchors = dialog.result
+            self.trilateration_engine.set_anchors(dialog.result)
             if self.gnss_calibrated:
                 self._auto_calibrate()
             self._draw_uwb_map()
