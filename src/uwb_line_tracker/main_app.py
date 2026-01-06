@@ -226,7 +226,6 @@ class CalibrationDialog(tk.Toplevel):
             self.serial_handler.stop_calibration()
             self.calibrator.stop_collection()
             self.calibrate_btn.config(text="Start Calibration")
-            self.calib_status.config(text="Stopped", foreground="orange")
             
             # Process results
             if self.calibrator.has_enough_data():
@@ -234,11 +233,25 @@ class CalibrationDialog(tk.Toplevel):
                 if result.success:
                     self._calibrated_anchors = result.anchors
                     self._update_anchor_display()
-                    self.calib_status.config(text="Calibration successful!", foreground="green")
+                    # Check if d12 was estimated
+                    status = self.calibrator.get_collection_status()
+                    if status.get("has_d12", False):
+                        self.calib_status.config(text="Calibration successful!", foreground="green")
+                    else:
+                        self.calib_status.config(text="Success (d12 estimated)", foreground="orange")
                 else:
                     self.calib_status.config(text=f"Failed: {result.error_message}", foreground="red")
             else:
-                self.calib_status.config(text="Not enough data", foreground="red")
+                status = self.calibrator.get_collection_status()
+                missing = []
+                if not status.get("has_d01", False):
+                    missing.append("d01")
+                if not status.get("has_d02", False):
+                    missing.append("d02")
+                self.calib_status.config(
+                    text=f"Not enough data (need: {', '.join(missing) or 'd01, d02'})", 
+                    foreground="red"
+                )
         else:
             # Start calibration
             if not self.serial_handler.is_connected():
@@ -263,9 +276,18 @@ class CalibrationDialog(tk.Toplevel):
             status = self.calibrator.get_collection_status()
             # Show only valid pairs (within num_anchors)
             pairs_str = ", ".join([f"{k}: {v}" for k, v in sorted(status["pairs"].items())])
+            
+            # Show readiness status
+            ready_str = "Ready!" if status.get("ready", False) else "Collecting..."
+            d12_note = "" if status.get("has_d12", False) else " (d12 will be estimated)"
+            
             self.collection_label.config(
-                text=f"Pairs: {len(status['pairs'])}/3 | Samples: {pairs_str}"
+                text=f"Pairs: {status['valid_count']}/{status['required_count']} | {pairs_str}{d12_note}"
             )
+            
+            # Update calibration status color
+            if status.get("ready", False):
+                self.calib_status.config(text=ready_str, foreground="green")
         
         # Schedule next update
         self.after(200, self._update_status)
