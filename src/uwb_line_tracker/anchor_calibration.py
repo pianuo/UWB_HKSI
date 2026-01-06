@@ -91,10 +91,11 @@ class AnchorCalibrator:
             for target_id, distance in ranges.items():
                 # Only consider valid distances and anchors within our range
                 if distance > 0 and target_id != anchor_id:
-                    # Use canonical key (smaller id first)
+                    # Debug: Print first measurement for each pair
                     key = (min(anchor_id, target_id), max(anchor_id, target_id))
                     if key not in self._distance_matrix:
                         self._distance_matrix[key] = []
+                        print(f"[Calibrator] First measurement {key}: {distance} mm ({distance/1000:.3f} m)")
                     self._distance_matrix[key].append(distance)
     
     def get_collection_status(self) -> Dict[str, any]:
