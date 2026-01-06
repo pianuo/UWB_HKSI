@@ -15,8 +15,9 @@ pyzmq>=22.0.0
 # Image processing for UWB background map
 Pillow>=8.0.0
 
-# Serial port communication for UWB device
+# Serial communication for UWB devices
 pyserial>=3.5
 
 # Optional: For enhanced coordinate transformations
 # pyproj>=3.0.0
+
