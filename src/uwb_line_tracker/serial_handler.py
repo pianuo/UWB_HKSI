@@ -154,6 +154,7 @@ class UWBSerialHandler:
         """Start anchor self-calibration mode."""
         if self.send_command('$ancrangestart'):
             self._is_calibrating = True
+            self._debug_count = 0  # Reset debug counter
             print("[Serial] Calibration mode started")
             return True
         return False
@@ -197,6 +198,12 @@ class UWBSerialHandler:
         try:
             parsed = self._parse_data(frame)
             if parsed:
+                # Debug: Print first few parsed messages during calibration
+                if self._is_calibrating and hasattr(self, '_debug_count'):
+                    self._debug_count += 1
+                    if self._debug_count <= 3:
+                        print(f"[Serial Debug] Parsed: role={parsed.role}, id={parsed.base_station_id}, ranges={parsed.ranges[:4]}")
+                
                 # Notify callbacks
                 if self._range_callback:
                     self._range_callback(parsed)
@@ -309,9 +316,14 @@ class UWBSerialHandler:
             return None
         
         # Build range dictionary (only valid distances)
+        # Valid distance: > 0 and < 100m (100000mm)
+        # This filters out invalid/corrupted values
+        MAX_VALID_DISTANCE_MM = 100000  # 100 meters max
+        MIN_VALID_DISTANCE_MM = 10      # 1 cm min (filter noise)
+        
         ranges = {}
         for i, dist in enumerate(data.ranges):
-            if dist > 0:  # Valid distance
+            if MIN_VALID_DISTANCE_MM < dist < MAX_VALID_DISTANCE_MM:
                 ranges[i] = dist
         
         if not ranges:
