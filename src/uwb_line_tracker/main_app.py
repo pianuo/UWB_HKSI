@@ -45,7 +45,7 @@ from .coordinate_transform import (
     calculate_distance_to_line,
     check_line_crossing
 )
-from .udp_receiver import UDPReceiver, UWBTagData
+from .udp_receiver import UDPReceiver, UWBTagData, AnchorRangeData
 from .gnss_receiver import GNSSReceiver, GNSSData
 from .anchor_calibration import RealTimeCalibrator, AnchorPosition, CalibrationResult
 from .trilateration import TrilaterationEngine, UWBPositionCalculator
@@ -69,27 +69,35 @@ class AnchorCalibrationDialog(tk.Toplevel):
     Dialog for UWB Anchor Self-Calibration.
     
     Features:
-    - "Calibrate" button: Gets real-time calibration data and displays it
+    - "Start Collection" button: Starts automatic collection of anchor range data from UDP
+    - "Calibrate" button: Performs calibration using collected data
     - "Confirm" button: Applies the calibrated positions as anchor coordinates
     
     Based on RTLSClient.cpp lines 1046-1179 algorithm.
     """
     
-    def __init__(self, parent, calibrator: RealTimeCalibrator, apply_callback=None):
+    def __init__(self, parent, calibrator: RealTimeCalibrator, udp_receiver=None, apply_callback=None):
         super().__init__(parent)
         self.title("UWB Anchor Self-Calibration")
-        self.geometry("550x550")
+        self.geometry("550x600")
         self.resizable(False, False)
         self.transient(parent)
         self.grab_set()
         
         self.calibrator = calibrator
+        self.udp_receiver = udp_receiver
         self.apply_callback = apply_callback
         self.result = None
         self.calibration_result: Optional[CalibrationResult] = None
+        self.is_collecting = False
+        self._update_job = None
         
         self._create_widgets()
         self._update_status()
+        
+        # Set up UDP range callback if receiver is available
+        if self.udp_receiver:
+            self.udp_receiver.set_range_callback(self._on_range_data)
     
     def _create_widgets(self):
         main_frame = ttk.Frame(self, padding=10)
@@ -176,24 +184,116 @@ class AnchorCalibrationDialog(tk.Toplevel):
             self.position_labels[f"A{i}"] = {"x": x_label, "y": y_label, "z": z_label}
         
         # Status
-        self.status_var = tk.StringVar(value="Waiting for distance measurements...")
+        self.status_var = tk.StringVar(value="Click 'Start Collection' to begin automatic data collection")
         self.status_label = ttk.Label(main_frame, textvariable=self.status_var, 
                                        font=("Arial", 10), foreground="orange")
         self.status_label.pack(pady=10)
+        
+        # Collection status
+        self.collection_status_var = tk.StringVar(value="Collection: Stopped")
+        self.collection_status_label = ttk.Label(main_frame, textvariable=self.collection_status_var,
+                                                  font=("Arial", 9), foreground="gray")
+        self.collection_status_label.pack(pady=(0, 5))
         
         # Buttons
         btn_frame = ttk.Frame(main_frame)
         btn_frame.pack(fill=tk.X, pady=(10, 0))
         
-        ttk.Button(btn_frame, text="Calibrate", command=self._calibrate, 
-                   width=15).pack(side=tk.LEFT, padx=5)
-        ttk.Button(btn_frame, text="Reset", command=self._reset, 
+        # Left side buttons
+        left_btn_frame = ttk.Frame(btn_frame)
+        left_btn_frame.pack(side=tk.LEFT)
+        
+        self.start_collection_btn = ttk.Button(left_btn_frame, text="Start Collection", 
+                                               command=self._start_collection, width=15)
+        self.start_collection_btn.pack(side=tk.LEFT, padx=5)
+        
+        self.stop_collection_btn = ttk.Button(left_btn_frame, text="Stop Collection", 
+                                              command=self._stop_collection, width=15, state=tk.DISABLED)
+        self.stop_collection_btn.pack(side=tk.LEFT, padx=5)
+        
+        ttk.Button(left_btn_frame, text="Calibrate", command=self._calibrate, 
+                   width=12).pack(side=tk.LEFT, padx=5)
+        ttk.Button(left_btn_frame, text="Reset", command=self._reset, 
                    width=12).pack(side=tk.LEFT, padx=5)
         
-        ttk.Button(btn_frame, text="Close", command=self._on_close, 
-                   width=12).pack(side=tk.RIGHT, padx=5)
-        ttk.Button(btn_frame, text="Confirm", command=self._on_confirm, 
-                   width=15).pack(side=tk.RIGHT, padx=5)
+        # Right side buttons
+        right_btn_frame = ttk.Frame(btn_frame)
+        right_btn_frame.pack(side=tk.RIGHT)
+        
+        ttk.Button(right_btn_frame, text="Close", command=self._on_close, 
+                   width=12).pack(side=tk.LEFT, padx=5)
+        ttk.Button(right_btn_frame, text="Confirm", command=self._on_confirm, 
+                   width=15).pack(side=tk.LEFT, padx=5)
+    
+    def _start_collection(self):
+        """Start automatic collection of anchor range data."""
+        if not self.udp_receiver:
+            messagebox.showwarning("Warning", "UDP receiver not available. Cannot collect data automatically.")
+            return
+        
+        if not self.udp_receiver.is_running:
+            messagebox.showwarning("Warning", "UDP receiver is not running. Please start it first.")
+            return
+        
+        self.is_collecting = True
+        self.start_collection_btn.config(state=tk.DISABLED)
+        self.stop_collection_btn.config(state=tk.NORMAL)
+        self.collection_status_var.set("Collection: Active (collecting data from UDP...)")
+        self.collection_status_label.config(foreground="green")
+        self.status_var.set("Collecting anchor range data...")
+        self.status_label.config(foreground="blue")
+        
+        # Start periodic update
+        self._update_from_udp()
+    
+    def _stop_collection(self):
+        """Stop automatic collection."""
+        self.is_collecting = False
+        self.start_collection_btn.config(state=tk.NORMAL)
+        self.stop_collection_btn.config(state=tk.DISABLED)
+        self.collection_status_var.set("Collection: Stopped")
+        self.collection_status_label.config(foreground="gray")
+        
+        if self._update_job:
+            self.after_cancel(self._update_job)
+            self._update_job = None
+        
+        self._update_status()
+    
+    def _on_range_data(self, range_data):
+        """Callback when anchor range data is received from UDP."""
+        if self.is_collecting:
+            # Add measurement to calibrator (convert mm to meters)
+            self.calibrator.add_measurement(
+                range_data.anchor_i,
+                range_data.anchor_j,
+                range_data.distance_mm / 1000.0
+            )
+            # Update display periodically (not on every packet)
+            if not self._update_job:
+                self._update_job = self.after(200, self._update_from_udp)
+    
+    def _update_from_udp(self):
+        """Update from UDP receiver and schedule next update."""
+        if not self.is_collecting:
+            return
+        
+        # Process any queued range data
+        if self.udp_receiver:
+            ranges = self.udp_receiver.get_all_ranges()
+            for range_data in ranges:
+                self.calibrator.add_measurement(
+                    range_data.anchor_i,
+                    range_data.anchor_j,
+                    range_data.distance_mm / 1000.0
+                )
+        
+        # Update display
+        self._update_status()
+        
+        # Schedule next update
+        if self.is_collecting:
+            self._update_job = self.after(500, self._update_from_udp)
     
     def _add_manual_distances(self):
         """Add manual distance measurements."""
@@ -262,6 +362,7 @@ class AnchorCalibrationDialog(tk.Toplevel):
     
     def _reset(self):
         """Reset calibration data."""
+        self._stop_collection()
         self.calibrator.reset()
         self.calibration_result = None
         
@@ -302,6 +403,10 @@ class AnchorCalibrationDialog(tk.Toplevel):
     
     def _on_close(self):
         """Close the dialog."""
+        self._stop_collection()
+        # Clear UDP range callback
+        if self.udp_receiver:
+            self.udp_receiver.set_range_callback(None)
         self.destroy()
 
 
@@ -928,6 +1033,7 @@ class MainApplication:
         dialog = AnchorCalibrationDialog(
             self.root, 
             self.anchor_calibrator,
+            udp_receiver=self.udp_receiver,
             apply_callback=apply_calibrated_anchors
         )
         self.root.wait_window(dialog)
