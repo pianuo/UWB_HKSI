@@ -49,6 +49,7 @@ from .udp_receiver import UDPReceiver, UWBTagData, AnchorRangeData
 from .gnss_receiver import GNSSReceiver, GNSSData
 from .anchor_calibration import RealTimeCalibrator, AnchorPosition, CalibrationResult
 from .trilateration import TrilaterationEngine, UWBPositionCalculator
+from .serial_comm import SerialCalibrationComm, AnchorRangeMeasurement
 
 
 @dataclass
@@ -76,7 +77,7 @@ class AnchorCalibrationDialog(tk.Toplevel):
     Based on RTLSClient.cpp lines 1046-1179 algorithm.
     """
     
-    def __init__(self, parent, calibrator: RealTimeCalibrator, udp_receiver=None, apply_callback=None):
+    def __init__(self, parent, calibrator: RealTimeCalibrator, serial_comm=None, apply_callback=None):
         super().__init__(parent)
         self.title("UWB Anchor Self-Calibration")
         self.geometry("550x600")
@@ -85,7 +86,7 @@ class AnchorCalibrationDialog(tk.Toplevel):
         self.grab_set()
         
         self.calibrator = calibrator
-        self.udp_receiver = udp_receiver
+        self.serial_comm = serial_comm
         self.apply_callback = apply_callback
         self.result = None
         self.calibration_result: Optional[CalibrationResult] = None
@@ -95,9 +96,9 @@ class AnchorCalibrationDialog(tk.Toplevel):
         self._create_widgets()
         self._update_status()
         
-        # Set up UDP range callback if receiver is available
-        if self.udp_receiver:
-            self.udp_receiver.set_range_callback(self._on_range_data)
+        # Set up serial range callback if available
+        if self.serial_comm:
+            self.serial_comm.set_range_callback(self._on_range_data)
     
     def _create_widgets(self):
         main_frame = ttk.Frame(self, padding=10)
@@ -226,25 +227,36 @@ class AnchorCalibrationDialog(tk.Toplevel):
                    width=15).pack(side=tk.LEFT, padx=5)
     
     def _start_collection(self):
-        """Start automatic collection of anchor range data."""
-        if not self.udp_receiver:
-            messagebox.showwarning("Warning", "UDP receiver not available. Cannot collect data automatically.")
+        """Start automatic collection of anchor range data via serial port."""
+        if not self.serial_comm:
+            messagebox.showwarning("Warning", "Serial communication not available. Cannot collect data automatically.")
             return
         
-        if not self.udp_receiver.is_running:
-            messagebox.showwarning("Warning", "UDP receiver is not running. Please start it first.")
+        # Connect to serial port
+        if not self.serial_comm.is_connected:
+            if not self.serial_comm.connect():
+                messagebox.showerror("Error", f"Failed to connect to {self.serial_comm.port}.\nPlease check:\n1. Port is available\n2. No other program is using it\n3. Hardware is connected")
+                return
+        
+        # Start receiving thread
+        if not self.serial_comm.start():
+            messagebox.showerror("Error", "Failed to start serial communication thread.")
             return
+        
+        # Enter calibration mode
+        if not self.serial_comm.enter_calibration_mode():
+            messagebox.showwarning("Warning", "Failed to send calibration mode command.\nData collection may still work if hardware is already in calibration mode.")
         
         self.is_collecting = True
         self.start_collection_btn.config(state=tk.DISABLED)
         self.stop_collection_btn.config(state=tk.NORMAL)
-        self.collection_status_var.set("Collection: Active (collecting data from UDP...)")
+        self.collection_status_var.set(f"Collection: Active (receiving from {self.serial_comm.port}...)")
         self.collection_status_label.config(foreground="green")
-        self.status_var.set("Collecting anchor range data...")
+        self.status_var.set("Collecting anchor range data from serial port...")
         self.status_label.config(foreground="blue")
         
         # Start periodic update
-        self._update_from_udp()
+        self._update_from_serial()
     
     def _stop_collection(self):
         """Stop automatic collection."""
@@ -258,10 +270,18 @@ class AnchorCalibrationDialog(tk.Toplevel):
             self.after_cancel(self._update_job)
             self._update_job = None
         
+        # Exit calibration mode
+        if self.serial_comm and self.serial_comm.in_calibration_mode:
+            self.serial_comm.exit_calibration_mode()
+        
+        # Stop serial communication (but keep connection)
+        if self.serial_comm:
+            self.serial_comm.stop()
+        
         self._update_status()
     
-    def _on_range_data(self, range_data):
-        """Callback when anchor range data is received from UDP."""
+    def _on_range_data(self, range_data: AnchorRangeMeasurement):
+        """Callback when anchor range data is received from serial port."""
         if self.is_collecting:
             # Add measurement to calibrator (convert mm to meters)
             self.calibrator.add_measurement(
@@ -271,16 +291,16 @@ class AnchorCalibrationDialog(tk.Toplevel):
             )
             # Update display periodically (not on every packet)
             if not self._update_job:
-                self._update_job = self.after(200, self._update_from_udp)
+                self._update_job = self.after(200, self._update_from_serial)
     
-    def _update_from_udp(self):
-        """Update from UDP receiver and schedule next update."""
+    def _update_from_serial(self):
+        """Update from serial port and schedule next update."""
         if not self.is_collecting:
             return
         
         # Process any queued range data
-        if self.udp_receiver:
-            ranges = self.udp_receiver.get_all_ranges()
+        if self.serial_comm:
+            ranges = self.serial_comm.get_all_ranges()
             for range_data in ranges:
                 self.calibrator.add_measurement(
                     range_data.anchor_i,
@@ -293,7 +313,7 @@ class AnchorCalibrationDialog(tk.Toplevel):
         
         # Schedule next update
         if self.is_collecting:
-            self._update_job = self.after(500, self._update_from_udp)
+            self._update_job = self.after(500, self._update_from_serial)
     
     def _add_manual_distances(self):
         """Add manual distance measurements."""
@@ -404,9 +424,9 @@ class AnchorCalibrationDialog(tk.Toplevel):
     def _on_close(self):
         """Close the dialog."""
         self._stop_collection()
-        # Clear UDP range callback
-        if self.udp_receiver:
-            self.udp_receiver.set_range_callback(None)
+        # Clear serial range callback
+        if self.serial_comm:
+            self.serial_comm.set_range_callback(None)
         self.destroy()
 
 
@@ -1033,7 +1053,7 @@ class MainApplication:
         dialog = AnchorCalibrationDialog(
             self.root, 
             self.anchor_calibrator,
-            udp_receiver=self.udp_receiver,
+            serial_comm=self.serial_calibration,
             apply_callback=apply_calibrated_anchors
         )
         self.root.wait_window(dialog)
