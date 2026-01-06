@@ -261,7 +261,8 @@ class CalibrationDialog(tk.Toplevel):
         """Update status display periodically."""
         if self._is_calibrating:
             status = self.calibrator.get_collection_status()
-            pairs_str = ", ".join([f"{k}: {v}" for k, v in status["pairs"].items()])
+            # Show only valid pairs (within num_anchors)
+            pairs_str = ", ".join([f"{k}: {v}" for k, v in sorted(status["pairs"].items())])
             self.collection_label.config(
                 text=f"Pairs: {len(status['pairs'])}/3 | Samples: {pairs_str}"
             )
@@ -825,40 +826,51 @@ class MainApplication:
         self.gnss_label.pack(side=tk.LEFT, padx=5)
     
     def _load_uwb_background_image(self):
-        """Load the UWB background image, zoom in 2x and fill the canvas."""
-        if not HAS_PIL:
-            return
+        """No longer loads image - now uses light blue background with auto-scaling."""
+        # Background is now drawn directly in _draw_uwb_map
+        self.uwb_bg_photo = None
+        self.uwb_bg_image = None
+        print("[UWB] Using light blue background with auto-scaling")
+    
+    def _calculate_uwb_auto_scale(self) -> Tuple[float, float, float]:
+        """
+        Calculate auto-scale parameters based on anchor positions.
+        Returns (scale, center_x, center_y) to fit all anchors in the canvas with margin.
+        """
+        if not self.uwb_anchors:
+            return 50.0, 0.0, 0.0  # Default scale
         
-        try:
-            if os.path.exists(self.uwb_bg_image_path):
-                # Load original image
-                original_image = Image.open(self.uwb_bg_image_path)
-                orig_width, orig_height = original_image.size
-                
-                # Calculate crop area for 2x zoom (show center portion)
-                # Crop to show 1/2 of the original (center crop)
-                crop_size = min(orig_width, orig_height) // 2
-                left = (orig_width - crop_size) // 2
-                top = (orig_height - crop_size) // 2
-                right = left + crop_size
-                bottom = top + crop_size
-                
-                # Crop center portion
-                cropped_image = original_image.crop((left, top, right, bottom))
-                
-                # Resize cropped image to fill canvas (2x zoom effect)
-                self.uwb_bg_image = cropped_image.resize(
-                    (self.uwb_canvas_width, self.uwb_canvas_height),
-                    Image.Resampling.LANCZOS
-                )
-                
-                self.uwb_bg_photo = ImageTk.PhotoImage(self.uwb_bg_image)
-                print(f"[UWB] Loaded background image: {self.uwb_bg_image_path}")
-                print(f"[UWB] Original: {orig_width}x{orig_height}, Cropped (2x zoom): {crop_size}x{crop_size}, Canvas: {self.uwb_canvas_width}x{self.uwb_canvas_height}")
-            else:
-                print(f"[UWB] Background image not found: {self.uwb_bg_image_path}")
-        except Exception as e:
-            print(f"[UWB] Failed to load background image: {e}")
+        # Get all anchor coordinates
+        xs = [a["x"] for a in self.uwb_anchors]
+        ys = [a["y"] for a in self.uwb_anchors]
+        
+        # Calculate bounding box
+        min_x, max_x = min(xs), max(xs)
+        min_y, max_y = min(ys), max(ys)
+        
+        # Calculate center
+        center_x = (min_x + max_x) / 2
+        center_y = (min_y + max_y) / 2
+        
+        # Calculate range with margin (20% padding)
+        range_x = max(max_x - min_x, 0.1)  # Prevent division by zero
+        range_y = max(max_y - min_y, 0.1)
+        
+        # Add 40% margin (20% on each side)
+        range_x *= 1.4
+        range_y *= 1.4
+        
+        # Calculate scale to fit in canvas
+        # Leave some margin (use 80% of canvas)
+        canvas_usable = min(self.uwb_canvas_width, self.uwb_canvas_height) * 0.8
+        
+        scale_x = canvas_usable / range_x if range_x > 0 else 50
+        scale_y = canvas_usable / range_y if range_y > 0 else 50
+        
+        # Use the smaller scale to ensure everything fits
+        scale = min(scale_x, scale_y)
+        
+        return scale, center_x, center_y
     
     def _show_anchor_settings(self):
         """Show anchor calibration dialog."""
@@ -928,22 +940,34 @@ class MainApplication:
             self.uwb_offset_y = dialog.result["offset_y"]
             self._draw_uwb_map()
     
-    def _transform_uwb_to_canvas(self, x: float, y: float) -> Tuple[int, int]:
-        """Transform UWB coordinates to canvas coordinates."""
-        # Apply rotation
+    def _transform_uwb_to_canvas(self, x: float, y: float, auto_scale: float = None, 
+                                     center_x: float = None, center_y: float = None) -> Tuple[int, int]:
+        """
+        Transform UWB coordinates to canvas coordinates.
+        Uses auto-scale based on anchor positions if auto_scale is provided.
+        """
+        # Get auto-scale parameters if not provided
+        if auto_scale is None:
+            auto_scale, center_x, center_y = self._calculate_uwb_auto_scale()
+        
+        # Center the coordinates
+        x_centered = x - center_x
+        y_centered = y - center_y
+        
+        # Apply manual rotation (if any)
         angle_rad = math.radians(self.uwb_rotation_deg)
         cos_a = math.cos(angle_rad)
         sin_a = math.sin(angle_rad)
         
-        # Rotate around origin
-        x_rot = x * cos_a - y * sin_a
-        y_rot = x * sin_a + y * cos_a
+        x_rot = x_centered * cos_a - y_centered * sin_a
+        y_rot = x_centered * sin_a + y_centered * cos_a
         
-        # Apply scale
-        x_scaled = x_rot * self.uwb_scale
-        y_scaled = y_rot * self.uwb_scale
+        # Apply auto-scale and manual scale
+        combined_scale = auto_scale * self.uwb_scale
+        x_scaled = x_rot * combined_scale
+        y_scaled = y_rot * combined_scale
         
-        # Apply offset
+        # Apply manual offset
         x_final = x_scaled + self.uwb_offset_x
         y_final = y_scaled + self.uwb_offset_y
         
@@ -954,71 +978,104 @@ class MainApplication:
         return int(canvas_x), int(canvas_y)
     
     def _draw_uwb_map(self):
-        """Draw UWB map on canvas with background image and markers."""
+        """Draw UWB map on canvas with light blue background and markers."""
         if not self.uwb_canvas:
             return
         
         # Clear canvas
         self.uwb_canvas.delete("all")
         
-        # Draw background image
-        if self.uwb_bg_photo:
-            self.uwb_canvas.create_image(
-                self.uwb_canvas_width // 2,
-                self.uwb_canvas_height // 2,
-                image=self.uwb_bg_photo,
-                anchor=tk.CENTER
-            )
+        # Draw light blue background
+        self.uwb_canvas.create_rectangle(
+            0, 0, self.uwb_canvas_width, self.uwb_canvas_height,
+            fill="#ADD8E6", outline=""  # Light blue color
+        )
+        
+        # Draw grid lines for reference
+        self._draw_uwb_grid()
+        
+        # Calculate auto-scale once for consistent transformation
+        auto_scale, center_x, center_y = self._calculate_uwb_auto_scale()
         
         # Draw anchors
         anchor_colors = ["red", "blue", "green"]
         for i, anchor in enumerate(self.uwb_anchors):
-            x, y = self._transform_uwb_to_canvas(anchor["x"], anchor["y"])
+            x, y = self._transform_uwb_to_canvas(anchor["x"], anchor["y"], auto_scale, center_x, center_y)
             # Draw anchor circle
             self.uwb_canvas.create_oval(
-                x - 8, y - 8, x + 8, y + 8,
-                fill=anchor_colors[i], outline="black", width=2
+                x - 10, y - 10, x + 10, y + 10,
+                fill=anchor_colors[i % len(anchor_colors)], outline="white", width=2
             )
             # Draw anchor label
             self.uwb_canvas.create_text(
-                x, y - 15,
+                x, y - 18,
                 text=f"A{i}",
-                font=("Arial", 10, "bold"),
+                font=("Arial", 11, "bold"),
                 fill="black"
+            )
+            # Show coordinates below anchor
+            self.uwb_canvas.create_text(
+                x, y + 20,
+                text=f"({anchor['x']:.2f}, {anchor['y']:.2f})",
+                font=("Arial", 8),
+                fill="#333333"
             )
         
         # Draw start line (anchor0 to anchor1)
         if len(self.uwb_anchors) >= 2:
             x0, y0 = self._transform_uwb_to_canvas(
                 self.uwb_anchors[0]["x"], 
-                self.uwb_anchors[0]["y"]
+                self.uwb_anchors[0]["y"],
+                auto_scale, center_x, center_y
             )
             x1, y1 = self._transform_uwb_to_canvas(
                 self.uwb_anchors[1]["x"], 
-                self.uwb_anchors[1]["y"]
+                self.uwb_anchors[1]["y"],
+                auto_scale, center_x, center_y
             )
             self.uwb_canvas.create_line(
                 x0, y0, x1, y1,
                 fill="red", width=3
+            )
+            # Label start line
+            mid_x, mid_y = (x0 + x1) / 2, (y0 + y1) / 2
+            self.uwb_canvas.create_text(
+                mid_x, mid_y - 15,
+                text="Start Line",
+                font=("Arial", 9, "italic"),
+                fill="darkred"
             )
         
         # Draw tag if available
         if self.uwb_tag_pos:
             tag_x, tag_y = self._transform_uwb_to_canvas(
                 self.uwb_tag_pos.x,
-                self.uwb_tag_pos.y
+                self.uwb_tag_pos.y,
+                auto_scale, center_x, center_y
             )
-            # Draw tag marker
+            # Draw tag marker (larger, more visible)
             self.uwb_canvas.create_oval(
-                tag_x - 6, tag_y - 6, tag_x + 6, tag_y + 6,
+                tag_x - 8, tag_y - 8, tag_x + 8, tag_y + 8,
                 fill="orange", outline="black", width=2
             )
             self.uwb_canvas.create_text(
-                tag_x, tag_y - 12,
+                tag_x, tag_y - 15,
                 text="Tag",
                 font=("Arial", 9, "bold"),
                 fill="black"
             )
+    
+    def _draw_uwb_grid(self):
+        """Draw reference grid on UWB canvas."""
+        # Draw subtle grid lines
+        grid_color = "#8CB8C8"  # Slightly darker than background
+        
+        # Vertical and horizontal center lines
+        cx, cy = self.uwb_canvas_width // 2, self.uwb_canvas_height // 2
+        
+        # Draw center crosshair (subtle)
+        self.uwb_canvas.create_line(cx, 0, cx, self.uwb_canvas_height, fill=grid_color, dash=(2, 4))
+        self.uwb_canvas.create_line(0, cy, self.uwb_canvas_width, cy, fill=grid_color, dash=(2, 4))
     
     def _manual_calibrate(self):
         """Manually trigger recalibration."""
