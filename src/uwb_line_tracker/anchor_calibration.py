@@ -1,12 +1,11 @@
 """
-UWB Anchor Self-Calibration using MDS (Multi-Dimensional Scaling).
+UWB Anchor Self-Calibration using geometric trilateration.
 Based on the RTLSClient.cpp algorithm for anchor position estimation.
 
-The algorithm:
-1. Collect TWR distances between all anchor pairs
-2. Build a distance matrix
-3. Apply MDS to estimate relative positions
-4. Apply angle rotation to align with reference coordinate system
+For 3 anchors, uses simple geometric calculation:
+- A0 at origin (0, 0)
+- A1 on positive X-axis
+- A2 positioned based on distances to A0 and A1
 """
 
 from __future__ import annotations
@@ -39,27 +38,26 @@ class CalibrationResult:
 
 class AnchorCalibrator:
     """
-    MDS-based anchor self-calibration.
+    Anchor self-calibration using geometric calculation.
     
-    Uses inter-anchor distance measurements to estimate anchor positions
-    in a local coordinate system where:
-    - Anchor 0 is at origin (0, 0)
-    - Anchor 1 is on the positive X-axis
-    - Anchor 2 is positioned based on distances to Anchor 0 and 1
+    For 3 anchors, positions are calculated as:
+    - Anchor 0 at origin (0, 0, z0)
+    - Anchor 1 on positive X-axis (d01, 0, z1)
+    - Anchor 2 positioned based on distances (x2, y2, z2)
     """
     
     def __init__(self, num_anchors: int = 3, n_dim: int = 2):
         self.num_anchors = num_anchors
         self.n_dim = n_dim  # 2D or 3D
         
-        # Distance matrix: distance[i][j] = distance from anchor i to anchor j
+        # Store distances for each anchor pair: (i, j) -> list of distances in mm
         self._distance_matrix: Dict[Tuple[int, int], List[int]] = {}
         self._lock = threading.Lock()
         
         # Calibration state
         self._collecting = False
         self._collection_start_time = 0.0
-        self._min_samples = 10  # Minimum samples per anchor pair
+        self._min_samples = 5  # Minimum samples per anchor pair
         
         # Result
         self._last_result: Optional[CalibrationResult] = None
@@ -83,16 +81,18 @@ class AnchorCalibrator:
         Add a distance measurement.
         
         Args:
-            anchor_id: The anchor that made the measurement
-            ranges: Dictionary of {other_anchor_id: distance_mm}
+            anchor_id: The anchor that made the measurement (source)
+            ranges: Dictionary of {target_anchor_id: distance_mm}
         """
         if not self._collecting:
             return
         
         with self._lock:
-            for other_id, distance in ranges.items():
-                if distance > 0 and other_id != anchor_id:
-                    key = (min(anchor_id, other_id), max(anchor_id, other_id))
+            for target_id, distance in ranges.items():
+                # Only consider valid distances and anchors within our range
+                if distance > 0 and target_id != anchor_id:
+                    # Use canonical key (smaller id first)
+                    key = (min(anchor_id, target_id), max(anchor_id, target_id))
                     if key not in self._distance_matrix:
                         self._distance_matrix[key] = []
                     self._distance_matrix[key].append(distance)
@@ -100,29 +100,38 @@ class AnchorCalibrator:
     def get_collection_status(self) -> Dict[str, any]:
         """Get current collection status."""
         with self._lock:
+            # Count only pairs within num_anchors
+            valid_pairs = {}
+            for (i, j), distances in self._distance_matrix.items():
+                if i < self.num_anchors and j < self.num_anchors:
+                    valid_pairs[f"{i}-{j}"] = len(distances)
+            
+            required_pairs = self.num_anchors * (self.num_anchors - 1) // 2
+            
             status = {
                 "collecting": self._collecting,
                 "duration": time.time() - self._collection_start_time if self._collecting else 0,
-                "pairs": {}
+                "pairs": valid_pairs,
+                "valid_count": len(valid_pairs),
+                "required_count": required_pairs
             }
-            for (i, j), distances in self._distance_matrix.items():
-                status["pairs"][f"{i}-{j}"] = len(distances)
             return status
     
     def has_enough_data(self) -> bool:
         """Check if we have enough measurements to calibrate."""
         required_pairs = self.num_anchors * (self.num_anchors - 1) // 2
         with self._lock:
-            if len(self._distance_matrix) < required_pairs:
-                return False
-            for distances in self._distance_matrix.values():
-                if len(distances) < self._min_samples:
-                    return False
-        return True
+            valid_count = 0
+            for (i, j), distances in self._distance_matrix.items():
+                if i < self.num_anchors and j < self.num_anchors:
+                    if len(distances) >= self._min_samples:
+                        valid_count += 1
+            return valid_count >= required_pairs
     
     def calibrate(self) -> CalibrationResult:
         """
         Perform calibration using collected measurements.
+        Uses simple geometric trilateration for 3 anchors.
         
         Returns:
             CalibrationResult with estimated anchor positions.
@@ -130,137 +139,104 @@ class AnchorCalibrator:
         with self._lock:
             distance_data = dict(self._distance_matrix)
         
-        # Check if we have enough data
-        required_pairs = self.num_anchors * (self.num_anchors - 1) // 2
-        if len(distance_data) < required_pairs:
-            return CalibrationResult(
-                success=False,
-                anchors=[],
-                error_message=f"Not enough anchor pairs. Got {len(distance_data)}, need {required_pairs}"
-            )
-        
         try:
-            # Build average distance matrix
+            # Extract distances between anchor pairs (only first num_anchors)
             n = self.num_anchors
-            twr_distance = np.zeros((n, n))
+            avg_distances = {}
             
             for (i, j), distances in distance_data.items():
-                if i < n and j < n:
-                    avg_dist = np.mean(distances) / 1000.0  # Convert mm to meters
-                    twr_distance[i, j] = avg_dist
-                    twr_distance[j, i] = avg_dist  # Symmetric
+                if i < n and j < n and len(distances) > 0:
+                    # Convert mm to meters and calculate average
+                    avg_dist = np.mean(distances) / 1000.0
+                    avg_distances[(i, j)] = avg_dist
+                    print(f"[Calibrator] Distance {i}-{j}: {avg_dist:.3f} m (from {len(distances)} samples)")
             
-            # Apply MDS algorithm
-            trans_coord = self._mds(twr_distance, n)
-            
-            # Apply angle rotation to align coordinate system
-            est_coord = self._angle_rotation(trans_coord, n)
-            
-            # Create result
-            anchors = []
-            for i in range(n):
-                anchors.append(AnchorPosition(
-                    id=i,
-                    x=float(est_coord[i, 0]),
-                    y=float(est_coord[i, 1]),
-                    z=0.0 if self.n_dim == 2 else float(est_coord[i, 2]) if est_coord.shape[1] > 2 else 0.0
-                ))
-            
-            self._last_result = CalibrationResult(
-                success=True,
-                anchors=anchors,
-                timestamp=time.time()
-            )
-            return self._last_result
+            # For 3 anchors, use simple geometric calculation
+            if n == 3:
+                # Get distances
+                d01 = avg_distances.get((0, 1), 0)
+                d02 = avg_distances.get((0, 2), 0)
+                d12 = avg_distances.get((1, 2), 0)
+                
+                if d01 <= 0 or d02 <= 0 or d12 <= 0:
+                    return CalibrationResult(
+                        success=False,
+                        anchors=[],
+                        error_message=f"Missing distances: d01={d01:.3f}, d02={d02:.3f}, d12={d12:.3f}"
+                    )
+                
+                # Calculate positions using geometric method
+                anchors = calibrate_3_anchors(d01, d02, d12)
+                
+                self._last_result = CalibrationResult(
+                    success=True,
+                    anchors=anchors,
+                    timestamp=time.time()
+                )
+                return self._last_result
+            else:
+                # For more anchors, use MDS
+                return self._calibrate_mds(avg_distances, n)
             
         except Exception as e:
+            import traceback
+            traceback.print_exc()
             return CalibrationResult(
                 success=False,
                 anchors=[],
                 error_message=str(e)
             )
     
-    def _mds(self, twr_distance: np.ndarray, n_nodes: int) -> np.ndarray:
-        """
-        Multi-Dimensional Scaling algorithm.
-        Converts distance matrix to coordinate estimates.
+    def _calibrate_mds(self, avg_distances: Dict[Tuple[int, int], float], n: int) -> CalibrationResult:
+        """Calibrate using MDS for more than 3 anchors."""
+        # Build distance matrix
+        twr_distance = np.zeros((n, n))
+        for (i, j), dist in avg_distances.items():
+            twr_distance[i, j] = dist
+            twr_distance[j, i] = dist
         
-        Based on RTLSClient::mds() from the C++ code.
-        """
-        # Square the distances
-        dist_squared = np.square(twr_distance)
+        # Classical MDS
+        # 1. Square the distances
+        D_sq = np.square(twr_distance)
         
-        # Centering operator: J = I - (1/n) * ones
-        centering_operator = np.eye(n_nodes) - np.ones((n_nodes, n_nodes)) / n_nodes
+        # 2. Double centering: B = -0.5 * J * D^2 * J
+        J = np.eye(n) - np.ones((n, n)) / n
+        B = -0.5 * J @ D_sq @ J
         
-        # Double centering: B = -0.5 * J * D^2 * J
-        centered_dist_squared = -0.5 * centering_operator @ dist_squared @ centering_operator
+        # 3. Eigendecomposition
+        eigenvalues, eigenvectors = np.linalg.eigh(B)
         
-        # SVD decomposition
-        U, S, Vt = np.linalg.svd(centered_dist_squared)
+        # Sort by eigenvalues (descending)
+        idx = np.argsort(eigenvalues)[::-1]
+        eigenvalues = eigenvalues[idx]
+        eigenvectors = eigenvectors[:, idx]
         
-        # Estimate geometry from SVD
-        # Take first n_dim dimensions
-        est_geom = np.zeros((n_nodes, self.n_dim))
-        for i in range(min(self.n_dim, len(S))):
-            est_geom[:, i] = U[:, i] * np.sqrt(max(S[i], 0))
+        # 4. Take first 2 dimensions
+        coords = np.zeros((n, 2))
+        for i in range(2):
+            if eigenvalues[i] > 0:
+                coords[:, i] = eigenvectors[:, i] * np.sqrt(eigenvalues[i])
         
-        # Translate so that first node (view_node=0) is at origin
-        view_node = 0
-        trans_coord = est_geom - est_geom[view_node, :]
+        # 5. Translate so A0 is at origin
+        coords = coords - coords[0, :]
         
-        return trans_coord
-    
-    def _angle_rotation(self, trans_coord: np.ndarray, n_nodes: int) -> np.ndarray:
-        """
-        Rotate coordinates to align with reference axes.
+        # 6. Rotate so A1 is on positive X-axis
+        if n > 1:
+            angle = np.arctan2(coords[1, 1], coords[1, 0])
+            cos_a, sin_a = np.cos(-angle), np.sin(-angle)
+            R = np.array([[cos_a, -sin_a], [sin_a, cos_a]])
+            coords = coords @ R.T
         
-        Based on RTLSClient::angleRotation() from the C++ code.
-        The result places:
-        - A0 at origin
-        - A1 on the positive X-axis
-        - A2 with positive Y (above the X-axis)
-        """
-        if trans_coord.shape[1] < 2:
-            return trans_coord
+        # 7. Ensure A2 has positive Y
+        if n > 2 and coords[2, 1] < 0:
+            coords[:, 1] = -coords[:, 1]
         
-        # Calculate distances from origin
-        trans_distance = np.sqrt(np.sum(trans_coord ** 2, axis=1))
+        anchors = [
+            AnchorPosition(id=i, x=float(coords[i, 0]), y=float(coords[i, 1]), z=0.0)
+            for i in range(n)
+        ]
         
-        # Calculate current angle of each point
-        current_angle = np.zeros(n_nodes)
-        for i in range(n_nodes):
-            if trans_distance[i] > 1e-6:
-                current_angle[i] = np.arccos(np.clip(trans_coord[i, 0] / trans_distance[i], -1, 1))
-                if trans_coord[i, 1] < 0:
-                    current_angle[i] = -current_angle[i]
-        
-        # Rotate so that anchor 1 is on positive X-axis
-        rotate_angle = current_angle[1] if n_nodes > 1 else 0
-        
-        # Build rotation matrix
-        cos_r = np.cos(rotate_angle)
-        sin_r = np.sin(rotate_angle)
-        rotation_matrix = np.array([
-            [cos_r, -sin_r],
-            [sin_r, cos_r]
-        ])
-        
-        # Apply rotation
-        coord = trans_coord[:, :2] @ rotation_matrix
-        
-        # Ensure anchor 2 has positive Y (if it exists)
-        if n_nodes > 2 and coord[2, 1] < 0:
-            coord[:, 1] = -coord[:, 1]
-        
-        # If 3D, keep Z coordinate
-        if trans_coord.shape[1] > 2:
-            result = np.zeros((n_nodes, 3))
-            result[:, :2] = coord
-            result[:, 2] = trans_coord[:, 2]
-            return result
-        
-        return coord
+        return CalibrationResult(success=True, anchors=anchors, timestamp=time.time())
     
     def get_last_result(self) -> Optional[CalibrationResult]:
         """Get the last calibration result."""
@@ -278,7 +254,6 @@ class AnchorCalibrator:
             self._last_result = None
 
 
-# Simplified calibration for 3 anchors using trilateration-style approach
 def calibrate_3_anchors(d01: float, d02: float, d12: float) -> List[AnchorPosition]:
     """
     Calibrate 3 anchors using inter-anchor distances.
@@ -306,7 +281,10 @@ def calibrate_3_anchors(d01: float, d02: float, d12: float) -> List[AnchorPositi
     # From A0: x^2 + y^2 = d02^2
     # From A1: (x - d01)^2 + y^2 = d12^2
     # Solving: x = (d01^2 + d02^2 - d12^2) / (2 * d01)
-    x2 = (d01**2 + d02**2 - d12**2) / (2 * d01) if d01 > 0 else 0
+    if d01 > 0:
+        x2 = (d01**2 + d02**2 - d12**2) / (2 * d01)
+    else:
+        x2 = 0
     
     # y^2 = d02^2 - x^2
     y2_squared = d02**2 - x2**2
@@ -316,36 +294,25 @@ def calibrate_3_anchors(d01: float, d02: float, d12: float) -> List[AnchorPositi
     
     a2 = AnchorPosition(id=2, x=x2, y=y2, z=0.0)
     
+    print(f"[Calibrator] 3-anchor result: A0=(0,0), A1=({d01:.3f},0), A2=({x2:.3f},{y2:.3f})")
+    
     return [a0, a1, a2]
 
 
 # Test code
 if __name__ == "__main__":
-    # Test simple 3-anchor calibration
     print("Testing 3-anchor calibration:")
-    # Example: equilateral triangle with 10m sides
-    anchors = calibrate_3_anchors(10.0, 10.0, 10.0)
+    
+    # Test with realistic distances (similar to user's setup: ~3m between anchors)
+    # From user's reference: A0=(0,0,2.22), A1=(3.02,0,2.15), A2=(1.47,2.56,2.14)
+    # d01 = 3.02, d02 = sqrt(1.47^2 + 2.56^2) = 2.95, d12 = sqrt((3.02-1.47)^2 + 2.56^2) = 2.99
+    
+    d01 = 3.02  # A0 to A1
+    d02 = 2.95  # A0 to A2
+    d12 = 2.99  # A1 to A2
+    
+    anchors = calibrate_3_anchors(d01, d02, d12)
+    print("Expected: A0=(0,0), A1=(3.02,0), A2=(1.47,2.56)")
+    print("Got:")
     for a in anchors:
         print(f"  Anchor {a.id}: ({a.x:.3f}, {a.y:.3f}, {a.z:.3f})")
-    
-    # Test MDS calibrator
-    print("\nTesting MDS calibrator:")
-    calibrator = AnchorCalibrator(num_anchors=3)
-    calibrator.start_collection()
-    
-    # Simulate measurements (10m equilateral triangle)
-    for _ in range(20):
-        calibrator.add_measurement(0, {1: 10000, 2: 10000})  # 10m in mm
-        calibrator.add_measurement(1, {0: 10000, 2: 10000})
-        calibrator.add_measurement(2, {0: 10000, 1: 10000})
-    
-    calibrator.stop_collection()
-    
-    result = calibrator.calibrate()
-    print(f"Success: {result.success}")
-    if result.success:
-        for a in result.anchors:
-            print(f"  Anchor {a.id}: ({a.x:.3f}, {a.y:.3f}, {a.z:.3f})")
-    else:
-        print(f"Error: {result.error_message}")
-
