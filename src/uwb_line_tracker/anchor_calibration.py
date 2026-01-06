@@ -102,31 +102,64 @@ class AnchorCalibrator:
         with self._lock:
             # Count only pairs within num_anchors
             valid_pairs = {}
+            has_d01 = False
+            has_d02 = False
+            has_d12 = False
+            
             for (i, j), distances in self._distance_matrix.items():
                 if i < self.num_anchors and j < self.num_anchors:
                     valid_pairs[f"{i}-{j}"] = len(distances)
+                    if (i, j) == (0, 1) and len(distances) >= self._min_samples:
+                        has_d01 = True
+                    if (i, j) == (0, 2) and len(distances) >= self._min_samples:
+                        has_d02 = True
+                    if (i, j) == (1, 2) and len(distances) >= self._min_samples:
+                        has_d12 = True
             
-            required_pairs = self.num_anchors * (self.num_anchors - 1) // 2
+            # For 3 anchors, minimum is 2 pairs (d01 and d02)
+            if self.num_anchors == 3:
+                min_required = 2  # d01 and d02 are required
+                ready = has_d01 and has_d02
+            else:
+                min_required = self.num_anchors - 1
+                ready = len(valid_pairs) >= min_required
             
             status = {
                 "collecting": self._collecting,
                 "duration": time.time() - self._collection_start_time if self._collecting else 0,
                 "pairs": valid_pairs,
                 "valid_count": len(valid_pairs),
-                "required_count": required_pairs
+                "required_count": min_required,
+                "ready": ready,
+                "has_d01": has_d01,
+                "has_d02": has_d02,
+                "has_d12": has_d12,
             }
             return status
     
     def has_enough_data(self) -> bool:
         """Check if we have enough measurements to calibrate."""
-        required_pairs = self.num_anchors * (self.num_anchors - 1) // 2
         with self._lock:
             valid_count = 0
+            has_d01 = False
+            has_d02 = False
+            
             for (i, j), distances in self._distance_matrix.items():
                 if i < self.num_anchors and j < self.num_anchors:
                     if len(distances) >= self._min_samples:
                         valid_count += 1
-            return valid_count >= required_pairs
+                        if (i, j) == (0, 1):
+                            has_d01 = True
+                        if (i, j) == (0, 2):
+                            has_d02 = True
+            
+            # For 3 anchors: minimum need d01 and d02 (can estimate d12)
+            # Ideally want all 3 pairs, but can work with 2 if from anchor 0
+            if self.num_anchors == 3:
+                return has_d01 and has_d02  # At least need these two
+            else:
+                # For more anchors, need at least num_anchors-1 pairs
+                return valid_count >= self.num_anchors - 1
     
     def calibrate(self) -> CalibrationResult:
         """
@@ -158,12 +191,22 @@ class AnchorCalibrator:
                 d02 = avg_distances.get((0, 2), 0)
                 d12 = avg_distances.get((1, 2), 0)
                 
-                if d01 <= 0 or d02 <= 0 or d12 <= 0:
+                # Check minimum required distances
+                if d01 <= 0 or d02 <= 0:
                     return CalibrationResult(
                         success=False,
                         anchors=[],
-                        error_message=f"Missing distances: d01={d01:.3f}, d02={d02:.3f}, d12={d12:.3f}"
+                        error_message=f"Missing required distances: d01={d01:.3f}, d02={d02:.3f}"
                     )
+                
+                # If d12 is missing, estimate it
+                # This happens when only anchor 0 reports distances
+                if d12 <= 0:
+                    # Estimate d12: assume roughly similar to average of d01 and d02
+                    # This gives a reasonable approximation for typical setups
+                    d12 = (d01 + d02) / 2
+                    print(f"[Calibrator] Warning: d12 missing, estimated as {d12:.3f} m (avg of d01 and d02)")
+                    print(f"[Calibrator] For accurate results, ensure all anchors report inter-anchor distances")
                 
                 # Calculate positions using geometric method
                 anchors = calibrate_3_anchors(d01, d02, d12)
