@@ -6,6 +6,8 @@ Features:
 - Speed, distance, and time calculations
 - Timing statistics
 - GNSS anchor data reception via TCP/ZMQ
+- Serial port UWB data with trilateration positioning
+- Anchor self-calibration using MDS algorithm
 """
 
 from __future__ import annotations
@@ -19,7 +21,7 @@ import os
 import tkinter as tk
 from tkinter import ttk, messagebox
 from datetime import datetime
-from typing import Optional, Tuple
+from typing import Optional, Tuple, List
 from dataclasses import dataclass
 
 try:
@@ -45,11 +47,11 @@ from .coordinate_transform import (
     calculate_distance_to_line,
     check_line_crossing
 )
-from .udp_receiver import UDPReceiver, UWBTagData, AnchorRangeData
+from .udp_receiver import UDPReceiver, UWBTagData
 from .gnss_receiver import GNSSReceiver, GNSSData
-from .anchor_calibration import RealTimeCalibrator, AnchorPosition, CalibrationResult
-from .trilateration import TrilaterationEngine, UWBPositionCalculator
-from .serial_comm import SerialCalibrationComm, AnchorRangeMeasurement
+from .serial_receiver import SerialReceiver, UWBRangingData, get_available_ports, HAS_SERIAL
+from .trilateration_wrapper import TrilaterationEngine, Position3D
+from .anchor_calibration import AnchorCalibration, AnchorPosition
 
 
 @dataclass
@@ -67,375 +69,395 @@ class TimingStats:
 
 class AnchorCalibrationDialog(tk.Toplevel):
     """
-    Dialog for UWB Anchor Self-Calibration.
-    
+    Dialog for UWB anchor self-calibration.
     Features:
-    - "Start Collection" button: Starts automatic collection of anchor range data from UDP
-    - "Calibrate" button: Performs calibration using collected data
-    - "Confirm" button: Applies the calibrated positions as anchor coordinates
-    
-    Based on RTLSClient.cpp lines 1046-1179 algorithm.
+    - Serial port selection
+    - "Calibrate" button: Start/stop calibration data collection
+    - "Confirm" button: Apply calibrated anchor positions
+    - Real-time display of calibration data
     """
     
-    def __init__(self, parent, calibrator: RealTimeCalibrator, serial_comm=None, apply_callback=None):
+    def __init__(self, parent, current_anchors: list, serial_receiver: SerialReceiver, on_confirm=None):
         super().__init__(parent)
         self.title("UWB Anchor Self-Calibration")
-        self.geometry("550x600")
+        self.geometry("600x550")
         self.resizable(False, False)
         self.transient(parent)
         self.grab_set()
         
-        self.calibrator = calibrator
-        self.serial_comm = serial_comm
-        self.apply_callback = apply_callback
         self.result = None
-        self.calibration_result: Optional[CalibrationResult] = None
-        self.is_collecting = False
-        self._update_job = None
+        self.current_anchors = current_anchors
+        self.serial_receiver = serial_receiver
+        self.on_confirm = on_confirm
+        
+        self._calibration = AnchorCalibration(num_anchors=len(current_anchors))
+        self._is_calibrating = False
+        self._calibration_start_time = None
+        self._calibration_samples = 0
+        self._calibrated_positions: Optional[List[AnchorPosition]] = None
+        
+        # Distance measurements storage
+        self._distance_buffer = {}  # {(from_id, to_id): [distances]}
         
         self._create_widgets()
-        self._update_status()
+        self._update_port_list()
         
-        # Set up serial range callback if available
-        if self.serial_comm:
-            self.serial_comm.set_range_callback(self._on_range_data)
+        # Start update loop
+        self._update_id = None
+        self._start_update_loop()
     
     def _create_widgets(self):
         main_frame = ttk.Frame(self, padding=10)
         main_frame.pack(fill=tk.BOTH, expand=True)
         
         # Title
-        ttk.Label(main_frame, text="UWB Anchor Self-Calibration", 
-                  font=("Arial", 14, "bold")).pack(pady=(0, 10))
+        title_label = ttk.Label(main_frame, text="UWB Anchor Self-Calibration", 
+                                font=("Arial", 14, "bold"))
+        title_label.pack(pady=(0, 10))
         
         # Instructions
-        info_text = (
-            "This tool calibrates anchor positions using inter-anchor range measurements.\n"
-            "Algorithm: MDS (Multi-Dimensional Scaling) + Angle Rotation\n"
-            "Result: A0 at origin, A1 on X-axis, A2 in first quadrant"
-        )
-        ttk.Label(main_frame, text=info_text, font=("Arial", 9), 
-                  foreground="gray", justify=tk.LEFT).pack(pady=(0, 10))
+        info_text = """Instructions:
+1. Connect UWB device via serial port
+2. Click "Start Calibration" to begin collecting inter-anchor distances
+3. Wait for sufficient samples (at least 10-20 seconds)
+4. Click "Stop Calibration" to process data
+5. Review the calculated anchor positions
+6. Click "Confirm" to apply the calibrated positions"""
         
-        # Distance Matrix Display
+        info_label = ttk.Label(main_frame, text=info_text, font=("Arial", 9), 
+                               justify=tk.LEFT, foreground="gray")
+        info_label.pack(pady=(0, 10), anchor=tk.W)
+        
+        # Serial port selection
+        port_frame = ttk.LabelFrame(main_frame, text="Serial Port", padding=5)
+        port_frame.pack(fill=tk.X, pady=5)
+        
+        port_row = ttk.Frame(port_frame)
+        port_row.pack(fill=tk.X)
+        
+        ttk.Label(port_row, text="Port:").pack(side=tk.LEFT, padx=5)
+        self.port_combo = ttk.Combobox(port_row, width=15, state="readonly")
+        self.port_combo.pack(side=tk.LEFT, padx=5)
+        
+        ttk.Button(port_row, text="Refresh", command=self._update_port_list).pack(side=tk.LEFT, padx=5)
+        
+        self.connect_btn = ttk.Button(port_row, text="Connect", command=self._toggle_connection)
+        self.connect_btn.pack(side=tk.LEFT, padx=5)
+        
+        self.connection_status = ttk.Label(port_row, text="Disconnected", foreground="red")
+        self.connection_status.pack(side=tk.LEFT, padx=10)
+        
+        # Calibration controls
+        cal_frame = ttk.LabelFrame(main_frame, text="Calibration", padding=5)
+        cal_frame.pack(fill=tk.X, pady=5)
+        
+        cal_row = ttk.Frame(cal_frame)
+        cal_row.pack(fill=tk.X)
+        
+        self.calibrate_btn = ttk.Button(cal_row, text="Start Calibration", 
+                                        command=self._toggle_calibration, width=20)
+        self.calibrate_btn.pack(side=tk.LEFT, padx=5)
+        
+        self.cal_status = ttk.Label(cal_row, text="Not started", font=("Arial", 10))
+        self.cal_status.pack(side=tk.LEFT, padx=10)
+        
+        # Progress
+        self.progress_var = tk.DoubleVar(value=0)
+        self.progress_bar = ttk.Progressbar(cal_frame, variable=self.progress_var, 
+                                            maximum=100, length=400)
+        self.progress_bar.pack(fill=tk.X, pady=5, padx=5)
+        
+        # Distance matrix display
         dist_frame = ttk.LabelFrame(main_frame, text="Inter-Anchor Distances (meters)", padding=5)
-        dist_frame.pack(fill=tk.X, pady=5)
+        dist_frame.pack(fill=tk.BOTH, expand=True, pady=5)
         
-        self.distance_labels = {}
-        dist_grid = ttk.Frame(dist_frame)
-        dist_grid.pack(fill=tk.X)
+        self.dist_text = tk.Text(dist_frame, height=6, width=50, font=("Consolas", 10))
+        self.dist_text.pack(fill=tk.BOTH, expand=True)
+        self.dist_text.insert(tk.END, "No calibration data yet...")
+        self.dist_text.config(state=tk.DISABLED)
         
-        # Headers
-        ttk.Label(dist_grid, text="Pair", font=("Arial", 10, "bold")).grid(row=0, column=0, padx=5)
-        ttk.Label(dist_grid, text="Count", font=("Arial", 10, "bold")).grid(row=0, column=1, padx=5)
-        ttk.Label(dist_grid, text="Avg Distance", font=("Arial", 10, "bold")).grid(row=0, column=2, padx=5)
+        # Result display
+        result_frame = ttk.LabelFrame(main_frame, text="Calibrated Anchor Positions (meters)", padding=5)
+        result_frame.pack(fill=tk.X, pady=5)
         
-        # Distance rows
-        pairs = ["A0-A1", "A0-A2", "A1-A2"]
-        for i, pair in enumerate(pairs):
-            ttk.Label(dist_grid, text=pair, font=("Consolas", 10)).grid(row=i+1, column=0, padx=5, sticky=tk.W)
-            count_label = ttk.Label(dist_grid, text="0", font=("Consolas", 10))
-            count_label.grid(row=i+1, column=1, padx=5)
-            dist_label = ttk.Label(dist_grid, text="-- m", font=("Consolas", 10))
-            dist_label.grid(row=i+1, column=2, padx=5)
-            self.distance_labels[pair] = {"count": count_label, "distance": dist_label}
-        
-        # Manual Distance Entry
-        manual_frame = ttk.LabelFrame(main_frame, text="Manual Distance Entry (mm)", padding=5)
-        manual_frame.pack(fill=tk.X, pady=5)
-        
-        manual_row = ttk.Frame(manual_frame)
-        manual_row.pack(fill=tk.X)
-        
-        ttk.Label(manual_row, text="A0-A1:").grid(row=0, column=0, padx=2)
-        self.dist_01_entry = ttk.Entry(manual_row, width=10)
-        self.dist_01_entry.grid(row=0, column=1, padx=2)
-        
-        ttk.Label(manual_row, text="A0-A2:").grid(row=0, column=2, padx=2)
-        self.dist_02_entry = ttk.Entry(manual_row, width=10)
-        self.dist_02_entry.grid(row=0, column=3, padx=2)
-        
-        ttk.Label(manual_row, text="A1-A2:").grid(row=0, column=4, padx=2)
-        self.dist_12_entry = ttk.Entry(manual_row, width=10)
-        self.dist_12_entry.grid(row=0, column=5, padx=2)
-        
-        ttk.Button(manual_row, text="Add", command=self._add_manual_distances).grid(row=0, column=6, padx=5)
-        
-        # Calibrated Positions Display
-        pos_frame = ttk.LabelFrame(main_frame, text="Calibrated Anchor Positions", padding=5)
-        pos_frame.pack(fill=tk.X, pady=5)
-        
-        self.position_labels = {}
-        pos_grid = ttk.Frame(pos_frame)
-        pos_grid.pack(fill=tk.X)
-        
-        ttk.Label(pos_grid, text="Anchor", font=("Arial", 10, "bold")).grid(row=0, column=0, padx=5)
-        ttk.Label(pos_grid, text="X (m)", font=("Arial", 10, "bold")).grid(row=0, column=1, padx=5)
-        ttk.Label(pos_grid, text="Y (m)", font=("Arial", 10, "bold")).grid(row=0, column=2, padx=5)
-        ttk.Label(pos_grid, text="Z (m)", font=("Arial", 10, "bold")).grid(row=0, column=3, padx=5)
-        
-        for i in range(3):
-            ttk.Label(pos_grid, text=f"A{i}", font=("Consolas", 10)).grid(row=i+1, column=0, padx=5, sticky=tk.W)
-            x_label = ttk.Label(pos_grid, text="--", font=("Consolas", 10))
-            x_label.grid(row=i+1, column=1, padx=5)
-            y_label = ttk.Label(pos_grid, text="--", font=("Consolas", 10))
-            y_label.grid(row=i+1, column=2, padx=5)
-            z_label = ttk.Label(pos_grid, text="0.00", font=("Consolas", 10))
-            z_label.grid(row=i+1, column=3, padx=5)
-            self.position_labels[f"A{i}"] = {"x": x_label, "y": y_label, "z": z_label}
-        
-        # Status
-        self.status_var = tk.StringVar(value="Click 'Start Collection' to begin automatic data collection")
-        self.status_label = ttk.Label(main_frame, textvariable=self.status_var, 
-                                       font=("Arial", 10), foreground="orange")
-        self.status_label.pack(pady=10)
-        
-        # Collection status
-        self.collection_status_var = tk.StringVar(value="Collection: Stopped")
-        self.collection_status_label = ttk.Label(main_frame, textvariable=self.collection_status_var,
-                                                  font=("Arial", 9), foreground="gray")
-        self.collection_status_label.pack(pady=(0, 5))
+        self.result_text = tk.Text(result_frame, height=4, width=50, font=("Consolas", 10))
+        self.result_text.pack(fill=tk.X)
+        self._display_current_anchors()
+        self.result_text.config(state=tk.DISABLED)
         
         # Buttons
         btn_frame = ttk.Frame(main_frame)
         btn_frame.pack(fill=tk.X, pady=(10, 0))
         
-        # Left side buttons
-        left_btn_frame = ttk.Frame(btn_frame)
-        left_btn_frame.pack(side=tk.LEFT)
+        self.confirm_btn = ttk.Button(btn_frame, text="Confirm", command=self._on_confirm, 
+                                      state=tk.DISABLED, width=15)
+        self.confirm_btn.pack(side=tk.RIGHT, padx=5)
         
-        self.start_collection_btn = ttk.Button(left_btn_frame, text="Start Collection", 
-                                               command=self._start_collection, width=15)
-        self.start_collection_btn.pack(side=tk.LEFT, padx=5)
+        ttk.Button(btn_frame, text="Cancel", command=self._on_cancel, width=15).pack(side=tk.RIGHT, padx=5)
         
-        self.stop_collection_btn = ttk.Button(left_btn_frame, text="Stop Collection", 
-                                              command=self._stop_collection, width=15, state=tk.DISABLED)
-        self.stop_collection_btn.pack(side=tk.LEFT, padx=5)
+        # Manual input frame
+        manual_frame = ttk.LabelFrame(main_frame, text="Manual Distance Input (for testing)", padding=5)
+        manual_frame.pack(fill=tk.X, pady=5)
         
-        ttk.Button(left_btn_frame, text="Calibrate", command=self._calibrate, 
-                   width=12).pack(side=tk.LEFT, padx=5)
-        ttk.Button(left_btn_frame, text="Reset", command=self._reset, 
-                   width=12).pack(side=tk.LEFT, padx=5)
+        manual_row = ttk.Frame(manual_frame)
+        manual_row.pack(fill=tk.X)
         
-        # Right side buttons
-        right_btn_frame = ttk.Frame(btn_frame)
-        right_btn_frame.pack(side=tk.RIGHT)
+        ttk.Label(manual_row, text="A0-A1 (mm):").grid(row=0, column=0, padx=2)
+        self.d01_entry = ttk.Entry(manual_row, width=10)
+        self.d01_entry.grid(row=0, column=1, padx=2)
+        self.d01_entry.insert(0, "25000")
         
-        ttk.Button(right_btn_frame, text="Close", command=self._on_close, 
-                   width=12).pack(side=tk.LEFT, padx=5)
-        ttk.Button(right_btn_frame, text="Confirm", command=self._on_confirm, 
-                   width=15).pack(side=tk.LEFT, padx=5)
+        ttk.Label(manual_row, text="A0-A2 (mm):").grid(row=0, column=2, padx=2)
+        self.d02_entry = ttk.Entry(manual_row, width=10)
+        self.d02_entry.grid(row=0, column=3, padx=2)
+        self.d02_entry.insert(0, "15811")
+        
+        ttk.Label(manual_row, text="A1-A2 (mm):").grid(row=0, column=4, padx=2)
+        self.d12_entry = ttk.Entry(manual_row, width=10)
+        self.d12_entry.grid(row=0, column=5, padx=2)
+        self.d12_entry.insert(0, "15811")
+        
+        ttk.Button(manual_row, text="Calibrate from Input", 
+                   command=self._manual_calibrate).grid(row=0, column=6, padx=10)
     
-    def _start_collection(self):
-        """Start automatic collection of anchor range data via serial port."""
-        if not self.serial_comm:
-            messagebox.showwarning("Warning", "Serial communication not available. Cannot collect data automatically.")
+    def _display_current_anchors(self):
+        """Display current anchor positions."""
+        self.result_text.config(state=tk.NORMAL)
+        self.result_text.delete(1.0, tk.END)
+        self.result_text.insert(tk.END, "Current positions:\n")
+        for i, anchor in enumerate(self.current_anchors):
+            self.result_text.insert(tk.END, f"  Anchor {i}: X={anchor.get('x', 0):.3f}, Y={anchor.get('y', 0):.3f}, Z={anchor.get('z', 0):.3f}\n")
+        self.result_text.config(state=tk.DISABLED)
+    
+    def _update_port_list(self):
+        """Update available serial ports."""
+        ports = get_available_ports()
+        self.port_combo['values'] = ports
+        if ports:
+            self.port_combo.current(0)
+        else:
+            self.port_combo.set("No ports found")
+    
+    def _toggle_connection(self):
+        """Toggle serial port connection."""
+        if self.serial_receiver.is_connected:
+            self.serial_receiver.stop()
+            self.connect_btn.config(text="Connect")
+            self.connection_status.config(text="Disconnected", foreground="red")
+        else:
+            port = self.port_combo.get()
+            if port and port != "No ports found":
+                self.serial_receiver.set_port(port)
+                if self.serial_receiver.start():
+                    self.connect_btn.config(text="Disconnect")
+                    self.connection_status.config(text=f"Connected to {port}", foreground="green")
+                else:
+                    messagebox.showerror("Error", f"Failed to connect to {port}")
+    
+    def _toggle_calibration(self):
+        """Toggle calibration mode."""
+        if self._is_calibrating:
+            self._stop_calibration()
+        else:
+            self._start_calibration()
+    
+    def _start_calibration(self):
+        """Start calibration data collection."""
+        if not self.serial_receiver.is_connected:
+            messagebox.showwarning("Warning", "Please connect to serial port first")
             return
         
-        # Connect to serial port
-        if not self.serial_comm.is_connected:
-            if not self.serial_comm.connect():
-                messagebox.showerror("Error", f"Failed to connect to {self.serial_comm.port}.\nPlease check:\n1. Port is available\n2. No other program is using it\n3. Hardware is connected")
-                return
+        self._is_calibrating = True
+        self._calibration_start_time = time.time()
+        self._calibration_samples = 0
+        self._distance_buffer = {}
+        self._calibration.reset()
         
-        # Start receiving thread
-        if not self.serial_comm.start():
-            messagebox.showerror("Error", "Failed to start serial communication thread.")
-            return
+        self.calibrate_btn.config(text="Stop Calibration")
+        self.cal_status.config(text="Collecting data...", foreground="blue")
+        self.confirm_btn.config(state=tk.DISABLED)
         
-        # Enter calibration mode
-        if not self.serial_comm.enter_calibration_mode():
-            messagebox.showwarning("Warning", "Failed to send calibration mode command.\nData collection may still work if hardware is already in calibration mode.")
-        
-        self.is_collecting = True
-        self.start_collection_btn.config(state=tk.DISABLED)
-        self.stop_collection_btn.config(state=tk.NORMAL)
-        self.collection_status_var.set(f"Collection: Active (receiving from {self.serial_comm.port}...)")
-        self.collection_status_label.config(foreground="green")
-        self.status_var.set("Collecting anchor range data from serial port...")
-        self.status_label.config(foreground="blue")
-        
-        # Start periodic update
-        self._update_from_serial()
+        # Enter calibration mode on device
+        self.serial_receiver.enter_calibration_mode()
+        self.serial_receiver.start_calibration()
     
-    def _stop_collection(self):
-        """Stop automatic collection."""
-        self.is_collecting = False
-        self.start_collection_btn.config(state=tk.NORMAL)
-        self.stop_collection_btn.config(state=tk.DISABLED)
-        self.collection_status_var.set("Collection: Stopped")
-        self.collection_status_label.config(foreground="gray")
+    def _stop_calibration(self):
+        """Stop calibration and process data."""
+        self._is_calibrating = False
+        self.calibrate_btn.config(text="Start Calibration")
+        self.cal_status.config(text="Processing...", foreground="orange")
         
-        if self._update_job:
-            self.after_cancel(self._update_job)
-            self._update_job = None
+        # Get collected data
+        cal_data = self.serial_receiver.stop_calibration()
+        self.serial_receiver.exit_calibration_mode()
         
-        # Exit calibration mode
-        if self.serial_comm and self.serial_comm.in_calibration_mode:
-            self.serial_comm.exit_calibration_mode()
+        # Process data into distance matrix
+        self._process_calibration_data(cal_data)
         
-        # Stop serial communication (but keep connection)
-        if self.serial_comm:
-            self.serial_comm.stop()
-        
-        self._update_status()
+        # Run calibration algorithm
+        self._run_calibration()
     
-    def _on_range_data(self, range_data: AnchorRangeMeasurement):
-        """Callback when anchor range data is received from serial port."""
-        if self.is_collecting:
-            # Add measurement to calibrator (convert mm to meters)
-            self.calibrator.add_measurement(
-                range_data.anchor_i,
-                range_data.anchor_j,
-                range_data.distance_mm / 1000.0
-            )
-            # Update display periodically (not on every packet)
-            if not self._update_job:
-                self._update_job = self.after(200, self._update_from_serial)
+    def _process_calibration_data(self, cal_data: list):
+        """Process collected calibration data into distance measurements."""
+        # For each sample, extract inter-anchor distances
+        for sample in cal_data:
+            ranges = sample.get('ranges', [])
+            anchor_id = int(sample.get('base_station_id', '0'))
+            
+            for i, dist in enumerate(ranges):
+                if dist > 0 and i != anchor_id:
+                    key = (anchor_id, i)
+                    if key not in self._distance_buffer:
+                        self._distance_buffer[key] = []
+                    self._distance_buffer[key].append(dist)
+        
+        # Update calibration object
+        for (from_id, to_id), distances in self._distance_buffer.items():
+            if distances:
+                median_dist = sum(distances) / len(distances)
+                self._calibration.add_distance_measurement(from_id, to_id, median_dist)
     
-    def _update_from_serial(self):
-        """Update from serial port and schedule next update."""
-        if not self.is_collecting:
-            return
+    def _run_calibration(self):
+        """Run MDS calibration algorithm."""
+        result = self._calibration.calibrate()
         
-        # Process any queued range data
-        if self.serial_comm:
-            ranges = self.serial_comm.get_all_ranges()
-            for range_data in ranges:
-                self.calibrator.add_measurement(
-                    range_data.anchor_i,
-                    range_data.anchor_j,
-                    range_data.distance_mm / 1000.0
-                )
+        if result:
+            self._calibrated_positions = result
+            self._display_calibration_result(result)
+            self.cal_status.config(text="Calibration successful!", foreground="green")
+            self.confirm_btn.config(state=tk.NORMAL)
+        else:
+            self.cal_status.config(text="Calibration failed - insufficient data", foreground="red")
+            messagebox.showwarning("Calibration Failed", 
+                                   "Insufficient distance data for calibration.\n"
+                                   "Please ensure all anchors can measure distances to each other.")
+    
+    def _display_calibration_result(self, positions: List[AnchorPosition]):
+        """Display calibration result."""
+        self.result_text.config(state=tk.NORMAL)
+        self.result_text.delete(1.0, tk.END)
+        self.result_text.insert(tk.END, "Calibrated positions:\n")
+        for pos in positions:
+            self.result_text.insert(tk.END, f"  Anchor {pos.id}: X={pos.x:.3f}, Y={pos.y:.3f}, Z={pos.z:.3f}\n")
+        self.result_text.config(state=tk.DISABLED)
+    
+    def _display_distance_matrix(self):
+        """Display current distance measurements."""
+        self.dist_text.config(state=tk.NORMAL)
+        self.dist_text.delete(1.0, tk.END)
         
-        # Update display
-        self._update_status()
+        if not self._distance_buffer:
+            self.dist_text.insert(tk.END, "No distance data collected yet...")
+        else:
+            self.dist_text.insert(tk.END, "Collected distances (mm):\n")
+            for (from_id, to_id), distances in sorted(self._distance_buffer.items()):
+                if from_id < to_id:  # Show each pair once
+                    avg = sum(distances) / len(distances) if distances else 0
+                    self.dist_text.insert(tk.END, 
+                        f"  A{from_id} <-> A{to_id}: {avg:.0f} mm ({len(distances)} samples)\n")
+        
+        self.dist_text.config(state=tk.DISABLED)
+    
+    def _manual_calibrate(self):
+        """Perform calibration from manually entered distances."""
+        try:
+            d01 = float(self.d01_entry.get())
+            d02 = float(self.d02_entry.get())
+            d12 = float(self.d12_entry.get())
+            
+            # Build distance matrix
+            matrix = [
+                [0, d01, d02],
+                [d01, 0, d12],
+                [d02, d12, 0]
+            ]
+            
+            # Update distance buffer for display
+            self._distance_buffer = {
+                (0, 1): [d01],
+                (0, 2): [d02],
+                (1, 2): [d12],
+            }
+            self._display_distance_matrix()
+            
+            # Create new calibration with manual data
+            import numpy as np
+            self._calibration = AnchorCalibration(num_anchors=3)
+            self._calibration.set_distance_matrix(np.array(matrix))
+            
+            # Run calibration
+            result = self._calibration.calibrate()
+            
+            if result:
+                self._calibrated_positions = result
+                self._display_calibration_result(result)
+                self.cal_status.config(text="Manual calibration successful!", foreground="green")
+                self.confirm_btn.config(state=tk.NORMAL)
+            else:
+                self.cal_status.config(text="Manual calibration failed", foreground="red")
+                
+        except ValueError as e:
+            messagebox.showerror("Error", f"Invalid input: {e}")
+    
+    def _start_update_loop(self):
+        """Start UI update loop."""
+        self._update_ui()
+    
+    def _update_ui(self):
+        """Update UI periodically."""
+        if self._is_calibrating:
+            elapsed = time.time() - self._calibration_start_time
+            # Update progress (assume 30 seconds for full progress)
+            progress = min(100, (elapsed / 30) * 100)
+            self.progress_var.set(progress)
+            
+            # Count samples
+            total_samples = sum(len(v) for v in self._distance_buffer.values())
+            self.cal_status.config(text=f"Collecting... {elapsed:.1f}s, {total_samples} samples")
+            
+            # Update distance display
+            self._display_distance_matrix()
         
         # Schedule next update
-        if self.is_collecting:
-            self._update_job = self.after(500, self._update_from_serial)
-    
-    def _add_manual_distances(self):
-        """Add manual distance measurements."""
-        try:
-            d01 = self.dist_01_entry.get().strip()
-            d02 = self.dist_02_entry.get().strip()
-            d12 = self.dist_12_entry.get().strip()
-            
-            if d01:
-                self.calibrator.add_measurement(0, 1, float(d01) / 1000.0)
-            if d02:
-                self.calibrator.add_measurement(0, 2, float(d02) / 1000.0)
-            if d12:
-                self.calibrator.add_measurement(1, 2, float(d12) / 1000.0)
-            
-            self._update_status()
-            self.status_var.set("Manual distances added")
-            self.status_label.config(foreground="blue")
-        except ValueError as e:
-            messagebox.showerror("Error", f"Invalid distance value: {e}")
-    
-    def _update_status(self):
-        """Update distance and status display."""
-        status = self.calibrator.get_measurement_status()
-        
-        for pair, info in status.items():
-            if pair in self.distance_labels:
-                self.distance_labels[pair]["count"].config(text=str(info["count"]))
-                if info["count"] > 0:
-                    self.distance_labels[pair]["distance"].config(
-                        text=f"{info['average_distance']:.3f} m"
-                    )
-                else:
-                    self.distance_labels[pair]["distance"].config(text="-- m")
-        
-        if self.calibrator.has_sufficient_data():
-            self.status_var.set("Ready to calibrate")
-            self.status_label.config(foreground="green")
-        else:
-            self.status_var.set("Need more measurements")
-            self.status_label.config(foreground="orange")
-    
-    def _calibrate(self):
-        """Perform calibration."""
-        if not self.calibrator.has_sufficient_data():
-            messagebox.showwarning("Warning", "Insufficient data for calibration.\nNeed at least one measurement for each anchor pair.")
-            return
-        
-        result = self.calibrator.perform_calibration()
-        self.calibration_result = result
-        
-        if result.success:
-            # Update position display
-            for anchor in result.anchors:
-                key = f"A{anchor.anchor_id}"
-                if key in self.position_labels:
-                    self.position_labels[key]["x"].config(text=f"{anchor.x:.3f}")
-                    self.position_labels[key]["y"].config(text=f"{anchor.y:.3f}")
-                    self.position_labels[key]["z"].config(text=f"{anchor.z:.3f}")
-            
-            self.status_var.set("Calibration successful!")
-            self.status_label.config(foreground="green")
-        else:
-            self.status_var.set(f"Calibration failed: {result.error_message}")
-            self.status_label.config(foreground="red")
-    
-    def _reset(self):
-        """Reset calibration data."""
-        self._stop_collection()
-        self.calibrator.reset()
-        self.calibration_result = None
-        
-        # Clear position display
-        for key in self.position_labels:
-            self.position_labels[key]["x"].config(text="--")
-            self.position_labels[key]["y"].config(text="--")
-        
-        # Clear distance entries
-        self.dist_01_entry.delete(0, tk.END)
-        self.dist_02_entry.delete(0, tk.END)
-        self.dist_12_entry.delete(0, tk.END)
-        
-        self._update_status()
-        self.status_var.set("Reset complete")
-        self.status_label.config(foreground="blue")
+        self._update_id = self.after(500, self._update_ui)
     
     def _on_confirm(self):
         """Confirm and apply calibrated positions."""
-        if not self.calibration_result or not self.calibration_result.success:
-            messagebox.showwarning("Warning", "No valid calibration result to confirm.\nPlease calibrate first.")
-            return
+        if self._calibrated_positions:
+            self.result = []
+            for pos in self._calibrated_positions:
+                self.result.append({
+                    "x": pos.x,
+                    "y": pos.y,
+                    "z": pos.z,
+                })
+            
+            if self.on_confirm:
+                self.on_confirm(self.result)
         
-        # Convert to anchor dict format
-        self.result = []
-        for anchor in self.calibration_result.anchors:
-            self.result.append({
-                "x": anchor.x,
-                "y": anchor.y,
-                "z": anchor.z
-            })
-        
-        if self.apply_callback:
-            self.apply_callback(self.result)
-        
-        self.status_var.set("Positions confirmed and applied!")
-        self.status_label.config(foreground="green")
-    
-    def _on_close(self):
-        """Close the dialog."""
-        self._stop_collection()
-        # Clear serial range callback
-        if self.serial_comm:
-            self.serial_comm.set_range_callback(None)
+        self._cleanup()
         self.destroy()
+    
+    def _on_cancel(self):
+        """Cancel and close dialog."""
+        self.result = None
+        self._cleanup()
+        self.destroy()
+    
+    def _cleanup(self):
+        """Clean up resources."""
+        if self._update_id:
+            self.after_cancel(self._update_id)
+        if self._is_calibrating:
+            self.serial_receiver.stop_calibration()
 
 
 class SettingsDialog(tk.Toplevel):
-    """Dialog for configuring UWB anchor positions manually."""
+    """Dialog for manually configuring UWB anchor positions."""
     
     def __init__(self, parent, current_anchors: list[dict]):
         super().__init__(parent)
-        self.title("UWB Anchor Settings (Manual)")
+        self.title("Manual Anchor Settings")
         self.geometry("400x350")
         self.resizable(False, False)
         self.transient(parent)
@@ -521,7 +543,7 @@ class TransformSettingsDialog(tk.Toplevel):
         self.rotation_deg = rotation_deg
         self.offset_x = offset_x
         self.offset_y = offset_y
-        self.apply_callback = apply_callback  # Callback function to apply settings without closing
+        self.apply_callback = apply_callback
         
         self._create_widgets()
         self._load_values()
@@ -601,17 +623,14 @@ class TransformSettingsDialog(tk.Toplevel):
                 "offset_y": float(self.offset_y_entry.get() or 0.0),
             }
             
-            # Update internal values
             self.scale = new_settings["scale"]
             self.rotation_deg = new_settings["rotation_deg"]
             self.offset_x = new_settings["offset_x"]
             self.offset_y = new_settings["offset_y"]
             
-            # Call callback to apply settings and refresh map
             if self.apply_callback:
                 self.apply_callback(new_settings)
             
-            # Show success message
             self.status_label.config(text="Settings applied!", foreground="green")
             self.after(1000, lambda: self.status_label.config(text="", foreground="black"))
             
@@ -620,7 +639,6 @@ class TransformSettingsDialog(tk.Toplevel):
     
     def _on_close(self):
         """Close the dialog."""
-        # Save final values to result before closing
         try:
             self.result = {
                 "scale": float(self.scale_entry.get() or 1.0),
@@ -629,7 +647,6 @@ class TransformSettingsDialog(tk.Toplevel):
                 "offset_y": float(self.offset_y_entry.get() or 0.0),
             }
         except ValueError:
-            # If invalid, use current values
             self.result = {
                 "scale": self.scale,
                 "rotation_deg": self.rotation_deg,
@@ -653,7 +670,6 @@ class TCPServerManager:
             return True
         
         try:
-            # Run tcp_server.py as a module
             self._process = subprocess.Popen(
                 [sys.executable, "-m", "uwb_line_tracker.tcp_server"],
                 stdout=subprocess.PIPE,
@@ -661,7 +677,6 @@ class TCPServerManager:
                 text=True
             )
             
-            # Start thread to read output
             self._stop_event.clear()
             self._thread = threading.Thread(target=self._read_output, daemon=True)
             self._thread.start()
@@ -719,14 +734,14 @@ class MainApplication:
         self.gnss_receiver = GNSSReceiver()
         self.tcp_server = TCPServerManager()
         
-        # Anchor self-calibration
-        self.anchor_calibrator = RealTimeCalibrator(num_anchors=3)
+        # Serial receiver and trilateration for direct positioning
+        self.serial_receiver = SerialReceiver()
+        self.trilateration = TrilaterationEngine()
         
-        # Trilateration engine for position calculation
-        self.trilateration_engine = TrilaterationEngine()
-        self.use_trilateration = False  # Toggle for using trilateration vs UDP position
+        # Data source mode: 'udp' or 'serial'
+        self.data_source = 'udp'  # Default to UDP for backward compatibility
         
-        # UWB anchor positions (to be configured)
+        # UWB anchor positions (to be configured or calibrated)
         self.uwb_anchors = [
             {"x": 0.0, "y": 0.0, "z": 0.0},
             {"x": 25.0, "y": 0.0, "z": 0.0},
@@ -734,10 +749,10 @@ class MainApplication:
         ]
         
         # UWB anchor transformation parameters (for image overlay)
-        self.uwb_scale = 1.0  # Scale factor
-        self.uwb_rotation_deg = 0.0  # Rotation in degrees
-        self.uwb_offset_x = 0.0  # X offset in meters
-        self.uwb_offset_y = 0.0  # Y offset in meters
+        self.uwb_scale = 1.0
+        self.uwb_rotation_deg = 0.0
+        self.uwb_offset_x = 0.0
+        self.uwb_offset_y = 0.0
         
         # UWB background image
         self.uwb_bg_image_path = os.path.join(
@@ -749,12 +764,12 @@ class MainApplication:
         
         # UWB map canvas (for custom image background) - Square shape
         self.uwb_canvas = None
-        self.uwb_canvas_width = 450  # Square: 300x300
+        self.uwb_canvas_width = 450
         self.uwb_canvas_height = 450
         
         # GNSS tag update throttling (1 second)
         self.last_gnss_tag_update_time = 0.0
-        self.gnss_tag_update_interval = 1.0  # 1 second
+        self.gnss_tag_update_interval = 1.0
         
         # GNSS anchor positions (from GNSS data)
         self.gnss_anchors: list[Optional[GNSSPosition]] = [None, None, None]
@@ -766,10 +781,10 @@ class MainApplication:
         
         # Tag tracking (UWB)
         self.uwb_tag_pos: Optional[UWBPosition] = None
-        self.gnss_tag_pos: Optional[GNSSPosition] = None  # UWB converted to GNSS
+        self.gnss_tag_pos: Optional[GNSSPosition] = None
         self.prev_uwb_tag_pos: Optional[UWBPosition] = None
         self.prev_update_time: Optional[float] = None
-        self.last_uwb_data_time: Optional[float] = None  # Timestamp of last UWB data
+        self.last_uwb_data_time: Optional[float] = None
         
         # Speed calculation with smoothing
         self.speed_history = []
@@ -804,35 +819,38 @@ class MainApplication:
         # Start TCP server for GNSS
         self.tcp_server.start()
         
-        # Give TCP server time to start
         time.sleep(0.5)
         
         # Start GNSS receiver (ZMQ)
         self.gnss_receiver.set_callback(self._on_gnss_data)
         self.gnss_receiver.start()
         
-        # Start UDP receiver for UWB
+        # Start UDP receiver for UWB (default mode)
         self.udp_receiver.start()
+        
+        # Update trilateration with anchor positions
+        self._update_trilateration_anchors()
+    
+    def _update_trilateration_anchors(self):
+        """Update trilateration engine with current anchor positions."""
+        if self.trilateration.is_loaded:
+            anchors = [(a["x"], a["y"], a["z"]) for a in self.uwb_anchors]
+            self.trilateration.set_anchors(anchors)
     
     def _on_gnss_data(self, data: GNSSData):
         """Callback when GNSS data is received."""
-        # Update anchor positions (client_id 0, 1, 2 are anchors)
         if data.client_id in [0, 1, 2]:
             self.gnss_anchors[data.client_id] = GNSSPosition(
                 lat=data.lat, lon=data.lng, alt=data.alt
             )
             
-            # Update GNSS status
             anchor_count = sum(1 for a in self.gnss_anchors if a is not None)
             self.root.after(0, lambda: self._update_gnss_status(anchor_count))
             
-            # Check if we have all anchors for calibration
             if not self.gnss_calibrated and all(a is not None for a in self.gnss_anchors):
                 self.gnss_calibrated = True
-                # Schedule calibration on main thread
                 self.root.after(100, self._auto_calibrate)
         else:
-            # Other client_ids are tags - update direct GNSS tag position
             self.gnss_direct_tag_pos = GNSSPosition(
                 lat=data.lat, lon=data.lng, alt=data.alt
             )
@@ -877,7 +895,6 @@ class MainApplication:
         
         # UWB Map (Left) - Canvas with image background (Square frame)
         uwb_frame = ttk.LabelFrame(maps_frame, text="UWB Positioning", padding=5)
-        # Pack without expand to maintain square shape
         uwb_frame.pack(side=tk.LEFT, padx=(0, 2))
         
         # Create canvas with fixed square size
@@ -888,14 +905,13 @@ class MainApplication:
             bg="white", 
             highlightthickness=0
         )
-        # Pack canvas without fill/expand to maintain exact square size
         self.uwb_canvas.pack()
-        self.uwb_map = None  # Not using tkintermapview for UWB map
+        self.uwb_map = None
         
         # Load background image
         self._load_uwb_background_image()
         
-        # GNSS Map (Right) - Smaller size (matching UWB square)
+        # GNSS Map (Right)
         gnss_frame = ttk.LabelFrame(maps_frame, text="GNSS Positioning", padding=5)
         gnss_frame.pack(side=tk.RIGHT, fill=tk.BOTH, expand=True, padx=(2, 0))
         
@@ -921,23 +937,31 @@ class MainApplication:
                                          font=("Arial", 14, "bold"), foreground="red")
         self.crossing_label.pack(side=tk.LEFT, padx=10)
         
+        # Data source selector
+        ttk.Label(status_frame, text="Data Source:", font=("Arial", 10)).pack(side=tk.LEFT, padx=(20, 5))
+        self.data_source_var = tk.StringVar(value="udp")
+        data_source_combo = ttk.Combobox(status_frame, textvariable=self.data_source_var, 
+                                         values=["udp", "serial"], width=10, state="readonly")
+        data_source_combo.pack(side=tk.LEFT, padx=5)
+        data_source_combo.bind("<<ComboboxSelected>>", self._on_data_source_change)
+        
         # Row 2: Metrics
         metrics_frame = ttk.Frame(bottom_frame)
         metrics_frame.pack(fill=tk.X, pady=5)
         
-        # Speed (larger font - 1.5x: 24 -> 36)
+        # Speed (larger font)
         speed_frame = ttk.LabelFrame(metrics_frame, text="Speed", padding=8)
         speed_frame.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=2)
         self.speed_var = tk.StringVar(value="0.00 m/s")
         ttk.Label(speed_frame, textvariable=self.speed_var, font=("Consolas", 36, "bold")).pack()
         
-        # Distance to line (larger font - 1.5x: 24 -> 36)
+        # Distance to line
         dist_frame = ttk.LabelFrame(metrics_frame, text="Distance to Start Line", padding=8)
         dist_frame.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=2)
         self.distance_var = tk.StringVar(value="0.00 m")
         ttk.Label(dist_frame, textvariable=self.distance_var, font=("Consolas", 36, "bold")).pack()
         
-        # Time to line (larger font - 1.5x: 24 -> 36)
+        # Time to line
         time_frame = ttk.LabelFrame(metrics_frame, text="Time to Start Line", padding=8)
         time_frame.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=2)
         self.time_to_line_var = tk.StringVar(value="-- s")
@@ -966,30 +990,24 @@ class MainApplication:
         ctrl_frame = ttk.Frame(bottom_frame)
         ctrl_frame.pack(fill=tk.X, pady=5)
         
-        # Anchor configuration buttons
         ttk.Button(ctrl_frame, text="Anchor Self-Calibration", 
-                   command=self._show_anchor_settings).pack(side=tk.LEFT, padx=5)
+                   command=self._show_calibration_dialog).pack(side=tk.LEFT, padx=5)
         ttk.Button(ctrl_frame, text="Manual Anchor Settings", 
-                   command=self._show_manual_anchor_settings).pack(side=tk.LEFT, padx=5)
+                   command=self._show_anchor_settings).pack(side=tk.LEFT, padx=5)
         ttk.Button(ctrl_frame, text="UWB Transform Settings", 
                    command=self._show_transform_settings).pack(side=tk.LEFT, padx=5)
-        
-        # Separator
-        ttk.Separator(ctrl_frame, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=10)
-        
-        # Timing buttons
         ttk.Button(ctrl_frame, text="Reset Timing", 
                    command=self._reset_timing).pack(side=tk.LEFT, padx=5)
         ttk.Button(ctrl_frame, text="Start Timing", 
                    command=self._start_timing).pack(side=tk.LEFT, padx=5)
-        ttk.Button(ctrl_frame, text="Recalibrate GNSS", 
+        ttk.Button(ctrl_frame, text="Recalibrate", 
                    command=self._manual_calibrate).pack(side=tk.LEFT, padx=5)
         
         # Status indicators frame
         status_container = ttk.LabelFrame(ctrl_frame, text="Connection Status", padding=3)
         status_container.pack(side=tk.RIGHT, padx=5)
         
-        # UWB status with data counter
+        # UWB status
         self.uwb_data_count = 0
         self.udp_status_var = tk.StringVar(value="UWB: Waiting (UDP 8080)")
         self.udp_label = ttk.Label(status_container, textvariable=self.udp_status_var, foreground="red")
@@ -1000,6 +1018,17 @@ class MainApplication:
         self.gnss_label = ttk.Label(status_container, textvariable=self.gnss_status_var, foreground="orange")
         self.gnss_label.pack(side=tk.LEFT, padx=5)
     
+    def _on_data_source_change(self, event):
+        """Handle data source change."""
+        new_source = self.data_source_var.get()
+        if new_source != self.data_source:
+            self.data_source = new_source
+            if new_source == 'serial':
+                self.udp_status_var.set("UWB: Serial Mode")
+                # Serial will be started when calibration dialog is used
+            else:
+                self.udp_status_var.set("UWB: Waiting (UDP 8080)")
+    
     def _load_uwb_background_image(self):
         """Load the UWB background image, zoom in 2x and fill the canvas."""
         if not HAS_PIL:
@@ -1007,22 +1036,17 @@ class MainApplication:
         
         try:
             if os.path.exists(self.uwb_bg_image_path):
-                # Load original image
                 original_image = Image.open(self.uwb_bg_image_path)
                 orig_width, orig_height = original_image.size
                 
-                # Calculate crop area for 2x zoom (show center portion)
-                # Crop to show 1/2 of the original (center crop)
                 crop_size = min(orig_width, orig_height) // 2
                 left = (orig_width - crop_size) // 2
                 top = (orig_height - crop_size) // 2
                 right = left + crop_size
                 bottom = top + crop_size
                 
-                # Crop center portion
                 cropped_image = original_image.crop((left, top, right, bottom))
                 
-                # Resize cropped image to fill canvas (2x zoom effect)
                 self.uwb_bg_image = cropped_image.resize(
                     (self.uwb_canvas_width, self.uwb_canvas_height),
                     Image.Resampling.LANCZOS
@@ -1030,46 +1054,38 @@ class MainApplication:
                 
                 self.uwb_bg_photo = ImageTk.PhotoImage(self.uwb_bg_image)
                 print(f"[UWB] Loaded background image: {self.uwb_bg_image_path}")
-                print(f"[UWB] Original: {orig_width}x{orig_height}, Cropped (2x zoom): {crop_size}x{crop_size}, Canvas: {self.uwb_canvas_width}x{self.uwb_canvas_height}")
             else:
                 print(f"[UWB] Background image not found: {self.uwb_bg_image_path}")
         except Exception as e:
             print(f"[UWB] Failed to load background image: {e}")
     
-    def _show_anchor_settings(self):
+    def _show_calibration_dialog(self):
         """Show anchor self-calibration dialog."""
-        def apply_calibrated_anchors(anchors):
-            """Apply calibrated anchor positions."""
-            self.uwb_anchors = anchors
-            # Update trilateration engine
-            self.trilateration_engine.set_anchors(anchors)
-            if self.gnss_calibrated:
-                self._auto_calibrate()
-            self._draw_uwb_map()
-            print(f"[Anchor Calibration] Applied new positions:")
-            for i, a in enumerate(anchors):
-                print(f"  A{i}: ({a['x']:.3f}, {a['y']:.3f}, {a['z']:.3f})")
+        def on_confirm(result):
+            if result:
+                self.uwb_anchors = result
+                self._update_trilateration_anchors()
+                if self.gnss_calibrated:
+                    self._auto_calibrate()
+                self._draw_uwb_map()
+                print(f"[Calibration] Applied new anchor positions: {result}")
         
         dialog = AnchorCalibrationDialog(
             self.root, 
-            self.anchor_calibrator,
-            serial_comm=self.serial_calibration,
-            apply_callback=apply_calibrated_anchors
+            self.uwb_anchors, 
+            self.serial_receiver,
+            on_confirm=on_confirm
         )
         self.root.wait_window(dialog)
-        
-        # If user confirmed calibration
-        if dialog.result:
-            apply_calibrated_anchors(dialog.result)
     
-    def _show_manual_anchor_settings(self):
+    def _show_anchor_settings(self):
         """Show manual anchor settings dialog."""
         dialog = SettingsDialog(self.root, self.uwb_anchors)
         self.root.wait_window(dialog)
         
         if dialog.result:
             self.uwb_anchors = dialog.result
-            self.trilateration_engine.set_anchors(dialog.result)
+            self._update_trilateration_anchors()
             if self.gnss_calibrated:
                 self._auto_calibrate()
             self._draw_uwb_map()
@@ -1077,7 +1093,6 @@ class MainApplication:
     def _show_transform_settings(self):
         """Show transform settings dialog."""
         def apply_settings(settings):
-            """Callback to apply settings immediately."""
             self.uwb_scale = settings["scale"]
             self.uwb_rotation_deg = settings["rotation_deg"]
             self.uwb_offset_x = settings["offset_x"]
@@ -1090,11 +1105,10 @@ class MainApplication:
             self.uwb_rotation_deg,
             self.uwb_offset_x,
             self.uwb_offset_y,
-            apply_callback=apply_settings  # Pass callback function
+            apply_callback=apply_settings
         )
         self.root.wait_window(dialog)
         
-        # Final update when dialog closes (in case user changed values but didn't click Apply)
         if dialog.result:
             self.uwb_scale = dialog.result["scale"]
             self.uwb_rotation_deg = dialog.result["rotation_deg"]
@@ -1104,26 +1118,21 @@ class MainApplication:
     
     def _transform_uwb_to_canvas(self, x: float, y: float) -> Tuple[int, int]:
         """Transform UWB coordinates to canvas coordinates."""
-        # Apply rotation
         angle_rad = math.radians(self.uwb_rotation_deg)
         cos_a = math.cos(angle_rad)
         sin_a = math.sin(angle_rad)
         
-        # Rotate around origin
         x_rot = x * cos_a - y * sin_a
         y_rot = x * sin_a + y * cos_a
         
-        # Apply scale
         x_scaled = x_rot * self.uwb_scale
         y_scaled = y_rot * self.uwb_scale
         
-        # Apply offset
         x_final = x_scaled + self.uwb_offset_x
         y_final = y_scaled + self.uwb_offset_y
         
-        # Convert to canvas coordinates (center origin, Y flipped)
         canvas_x = self.uwb_canvas_width / 2 + x_final
-        canvas_y = self.uwb_canvas_height / 2 - y_final  # Flip Y axis
+        canvas_y = self.uwb_canvas_height / 2 - y_final
         
         return int(canvas_x), int(canvas_y)
     
@@ -1132,10 +1141,8 @@ class MainApplication:
         if not self.uwb_canvas:
             return
         
-        # Clear canvas
         self.uwb_canvas.delete("all")
         
-        # Draw background image
         if self.uwb_bg_photo:
             self.uwb_canvas.create_image(
                 self.uwb_canvas_width // 2,
@@ -1148,12 +1155,10 @@ class MainApplication:
         anchor_colors = ["red", "blue", "green"]
         for i, anchor in enumerate(self.uwb_anchors):
             x, y = self._transform_uwb_to_canvas(anchor["x"], anchor["y"])
-            # Draw anchor circle
             self.uwb_canvas.create_oval(
                 x - 8, y - 8, x + 8, y + 8,
                 fill=anchor_colors[i], outline="black", width=2
             )
-            # Draw anchor label
             self.uwb_canvas.create_text(
                 x, y - 15,
                 text=f"A{i}",
@@ -1182,7 +1187,6 @@ class MainApplication:
                 self.uwb_tag_pos.x,
                 self.uwb_tag_pos.y
             )
-            # Draw tag marker
             self.uwb_canvas.create_oval(
                 tag_x - 6, tag_y - 6, tag_x + 6, tag_y + 6,
                 fill="orange", outline="black", width=2
@@ -1226,10 +1230,16 @@ class MainApplication:
     def _update_loop(self):
         """Main update loop."""
         try:
-            # Get latest UWB data
-            uwb_data = self.udp_receiver.get_latest_data()
-            if uwb_data:
-                self._process_uwb_data(uwb_data)
+            # Get data from appropriate source
+            if self.data_source == 'udp':
+                uwb_data = self.udp_receiver.get_latest_data()
+                if uwb_data:
+                    self._process_uwb_data(uwb_data)
+            elif self.data_source == 'serial':
+                # Process serial data with trilateration
+                serial_data = self.serial_receiver.get_latest_data()
+                if serial_data:
+                    self._process_serial_data(serial_data)
             
             # Update UWB map (Canvas)
             self._draw_uwb_map()
@@ -1240,10 +1250,10 @@ class MainApplication:
                 self._update_gnss_tag_marker()
                 self.last_gnss_tag_update_time = current_time
             
-            # Always update metrics display (even if no new data)
+            # Update metrics display
             self._update_metrics()
             
-            # Update GNSS anchor markers if we have new data
+            # Update GNSS anchor markers
             if self.gnss_calibrated and not self.gnss_anchor_markers_updated:
                 self._update_anchor_markers()
                 self.gnss_anchor_markers_updated = True
@@ -1251,47 +1261,79 @@ class MainApplication:
         except Exception as e:
             print(f"Update error: {e}")
         
-        # Schedule next update
-        self.root.after(50, self._update_loop)  # 20Hz update rate
+        self.root.after(50, self._update_loop)
     
-    def _process_uwb_data(self, data: UWBTagData):
-        """Process received UWB data."""
+    def _process_serial_data(self, data: UWBRangingData):
+        """Process serial UWB data and calculate position using trilateration."""
         current_time = time.time()
         
-        # Update UWB data counter and status
+        # Update status
+        self.uwb_data_count += 1
+        self.udp_status_var.set(f"UWB: Serial ({self.uwb_data_count} pkts)")
+        self.udp_label.config(foreground="green")
+        
+        # Calculate position using trilateration DLL
+        if self.trilateration.is_loaded:
+            position = self.trilateration.calculate_position(data.ranges)
+            if position:
+                self.prev_uwb_tag_pos = self.uwb_tag_pos
+                self.uwb_tag_pos = UWBPosition(position.x, position.y, position.z)
+                
+                # Calculate speed
+                if self.prev_uwb_tag_pos and self.last_uwb_data_time is not None:
+                    dt = current_time - self.last_uwb_data_time
+                    if dt > 0 and dt < 1.0:
+                        dx = self.uwb_tag_pos.x - self.prev_uwb_tag_pos.x
+                        dy = self.uwb_tag_pos.y - self.prev_uwb_tag_pos.y
+                        dist = math.hypot(dx, dy)
+                        instant_speed = dist / dt
+                        
+                        self.speed_history.append(instant_speed)
+                        if len(self.speed_history) > 10:
+                            self.speed_history.pop(0)
+                        if len(self.speed_history) > 0:
+                            self.current_speed = sum(self.speed_history) / len(self.speed_history)
+                
+                self.last_uwb_data_time = current_time
+                
+                # Transform to GNSS coordinates
+                if self.transformer.is_calibrated:
+                    self.gnss_tag_pos = self.transformer.transform(self.uwb_tag_pos)
+                
+                # Check line crossing
+                self._check_line_crossing(current_time)
+    
+    def _process_uwb_data(self, data: UWBTagData):
+        """Process received UWB data from UDP."""
+        current_time = time.time()
+        
         self.uwb_data_count += 1
         self.udp_status_var.set(f"UWB: Active ({self.uwb_data_count} pkts)")
         self.udp_label.config(foreground="green")
         
-        # Store previous position for speed calculation
         self.prev_uwb_tag_pos = self.uwb_tag_pos
         self.uwb_tag_pos = UWBPosition(data.x, data.y, data.z)
         
-        # Debug: Print received position
         if self.uwb_data_count <= 5 or self.uwb_data_count % 100 == 0:
             print(f"[UWB] Received: X={data.x:.3f}, Y={data.y:.3f}, Z={data.z:.3f}")
         
-        # Calculate speed using data timestamps
+        # Calculate speed
         if self.prev_uwb_tag_pos and self.last_uwb_data_time is not None:
-            # Use actual time difference between data packets
             dt = current_time - self.last_uwb_data_time
-            if dt > 0 and dt < 1.0:  # Sanity check: dt should be reasonable
+            if dt > 0 and dt < 1.0:
                 dx = self.uwb_tag_pos.x - self.prev_uwb_tag_pos.x
                 dy = self.uwb_tag_pos.y - self.prev_uwb_tag_pos.y
                 dist = math.hypot(dx, dy)
                 instant_speed = dist / dt
                 
-                # Smooth speed with moving average
                 self.speed_history.append(instant_speed)
                 if len(self.speed_history) > 10:
                     self.speed_history.pop(0)
                 if len(self.speed_history) > 0:
                     self.current_speed = sum(self.speed_history) / len(self.speed_history)
         elif self.prev_uwb_tag_pos is None:
-            # First data packet, initialize
             self.current_speed = 0.0
         
-        # Store timestamp for next calculation
         self.last_uwb_data_time = current_time
         
         # Transform to GNSS coordinates
@@ -1299,6 +1341,10 @@ class MainApplication:
             self.gnss_tag_pos = self.transformer.transform(self.uwb_tag_pos)
         
         # Check line crossing
+        self._check_line_crossing(current_time)
+    
+    def _check_line_crossing(self, current_time: float):
+        """Check if tag has crossed the start line."""
         if self.prev_uwb_tag_pos and not self.has_crossed:
             anchor0 = (self.uwb_anchors[0]["x"], self.uwb_anchors[0]["y"])
             anchor1 = (self.uwb_anchors[1]["x"], self.uwb_anchors[1]["y"])
@@ -1318,17 +1364,14 @@ class MainApplication:
     
     def _update_metrics(self):
         """Update speed, distance, and time metrics."""
-        # Always update display, even if no data yet
         if not self.uwb_tag_pos:
             self.speed_var.set("0.00 m/s")
             self.distance_var.set("-- m")
             self.time_to_line_var.set("-- s")
             return
         
-        # Display current speed (always update)
         self.speed_var.set(f"{self.current_speed:.2f} m/s")
         
-        # Calculate distance to start line (always update)
         anchor0 = (self.uwb_anchors[0]["x"], self.uwb_anchors[0]["y"])
         anchor1 = (self.uwb_anchors[1]["x"], self.uwb_anchors[1]["y"])
         tag_pos = (self.uwb_tag_pos.x, self.uwb_tag_pos.y)
@@ -1336,10 +1379,9 @@ class MainApplication:
         distance = abs(calculate_distance_to_line(tag_pos, anchor0, anchor1))
         self.distance_var.set(f"{distance:.2f} m")
         
-        # Calculate time to line (always update)
-        if self.current_speed > 0.01:  # Avoid division by very small numbers
+        if self.current_speed > 0.01:
             time_to_line = distance / self.current_speed
-            if time_to_line < 1000:  # Reasonable upper limit
+            if time_to_line < 1000:
                 self.time_to_line_var.set(f"{time_to_line:.2f} s")
             else:
                 self.time_to_line_var.set("-- s")
@@ -1351,7 +1393,6 @@ class MainApplication:
         if not HAS_MAP or not self.gnss_map:
             return
         
-        # Clear existing markers
         for marker in self.gnss_markers.values():
             try:
                 marker.delete()
@@ -1359,23 +1400,19 @@ class MainApplication:
                 pass
         self.gnss_markers.clear()
         
-        # Add anchor markers from GNSS data (GNSS map only)
         for i in range(3):
             gnss = self.gnss_anchors[i]
             if gnss:
                 try:
-                    # GNSS map
                     marker = self.gnss_map.set_marker(gnss.lat, gnss.lon, text=f"A{i}")
                     self.gnss_markers[f"anchor{i}"] = marker
                 except Exception as e:
                     print(f"Error adding marker {i}: {e}")
         
-        # Draw start line (anchor0 to anchor1) on GNSS map
         gnss0 = self.gnss_anchors[0]
         gnss1 = self.gnss_anchors[1]
         if gnss0 and gnss1:
             try:
-                # GNSS map start line
                 if self.gnss_start_line:
                     try:
                         self.gnss_start_line.delete()
@@ -1386,21 +1423,14 @@ class MainApplication:
                     color="red", width=3
                 )
                 
-                # Center GNSS map on anchors
                 center_lat = (gnss0.lat + gnss1.lat) / 2
                 center_lon = (gnss0.lon + gnss1.lon) / 2
                 self.gnss_map.set_position(center_lat, center_lon)
             except Exception as e:
                 print(f"Error drawing start line: {e}")
     
-    def _update_uwb_tag_marker(self):
-        """Update tag marker on UWB map (left map) - now handled by _draw_uwb_map."""
-        # UWB map is now drawn on Canvas, so this function is no longer needed
-        # Tag is drawn in _draw_uwb_map()
-        pass
-    
     def _update_gnss_tag_marker(self):
-        """Update tag marker on GNSS map (right map) with UWB-converted position."""
+        """Update tag marker on GNSS map with UWB-converted position."""
         if not HAS_MAP or not self.gnss_map or not self.gnss_tag_pos:
             return
         
@@ -1414,20 +1444,12 @@ class MainApplication:
         except Exception as e:
             print(f"Error updating GNSS tag marker: {e}")
     
-    def set_gnss_anchors(self, anchors: list[GNSSPosition]):
-        """Set GNSS anchor positions (for testing/manual configuration)."""
-        for i, gnss in enumerate(anchors[:3]):
-            self.gnss_anchors[i] = gnss
-        
-        if all(a is not None for a in self.gnss_anchors):
-            self.gnss_calibrated = True
-            self._auto_calibrate()
-    
     def _on_close(self):
         """Handle window close."""
         self.udp_receiver.stop()
         self.gnss_receiver.stop()
         self.tcp_server.stop()
+        self.serial_receiver.stop()
         self.root.destroy()
 
 
