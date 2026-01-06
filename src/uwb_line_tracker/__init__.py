@@ -19,6 +19,7 @@ __all__ = [
     "main_app",
     "anchor_calibration",
     "trilateration",
+    "serial_comm",
 ]
 
 
